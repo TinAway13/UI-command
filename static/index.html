@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GCP Linux Command UI</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <h1>GCP Linux Command UI</h1>
+
+    <section class="panel">
+      <h2>Connection</h2>
+      <label>JWT Token</label>
+      <input id="token" type="password" placeholder="Bearer JWT token" />
+      <button id="connectBtn">Connect</button>
+      <p id="status">Not connected</p>
+    </section>
+
+    <section class="panel explorer-panel">
+      <div class="explorer-header">
+        <h2>Workspace</h2>
+        <div class="toolbar">
+          <button id="upBtn" type="button" disabled title="Go up">Up</button>
+          <button id="refreshBtn" type="button" disabled title="Refresh">Refresh</button>
+        </div>
+      </div>
+      <div class="path-bar">
+        <span>Path</span>
+        <code id="currentPathText">-</code>
+      </div>
+      <div id="fileList" class="file-list" tabindex="0" aria-label="Workspace files">
+        <div class="empty-state">Connect to load workspace.</div>
+      </div>
+      <form id="commandForm" class="command-bar">
+        <label for="commandInput">Command</label>
+        <input id="commandInput" type="text" placeholder="cd folder, cd .., mkdir name, rename old new, delete name, refresh" disabled />
+        <button id="commandBtn" type="submit" disabled>Run</button>
+      </form>
+    </section>
+
+    <section class="panel">
+      <h2>Output</h2>
+      <pre id="output">Ready.</pre>
+    </section>
+
+    <section id="editorPanel" class="panel editor-panel" hidden>
+      <div class="editor-header">
+        <div>
+          <h2 id="editorTitle">File</h2>
+          <code id="editorPath">-</code>
+        </div>
+        <div class="toolbar">
+          <button id="saveFileBtn" type="button">Save</button>
+          <button id="closeEditorBtn" type="button">Close</button>
+        </div>
+      </div>
+      <textarea id="fileEditor" spellcheck="false"></textarea>
+    </section>
+  </div>
+
+  <nav id="contextMenu" class="context-menu" aria-hidden="true">
+    <button type="button" data-menu-action="open">Open</button>
+    <button type="button" data-menu-action="read-file">Read File</button>
+    <button type="button" data-menu-action="edit-file">Edit File</button>
+    <button type="button" data-menu-action="new-folder">New Folder</button>
+    <button type="button" data-menu-action="rename">Rename</button>
+    <button type="button" data-menu-action="delete">Delete</button>
+    <button type="button" data-menu-action="refresh">Refresh</button>
+  </nav>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
