@@ -421,23 +421,29 @@ func (s *Server) executeRequest(req ClientRequest) ServerResponse {
 }
 
 func runCommand(program string, args []string, dir string) ([]byte, error) {
-	reader, writer, err := os.Pipe()
+	outputFile, err := os.CreateTemp("", "ui-command-output-*")
 	if err != nil {
 		return nil, err
 	}
-	defer reader.Close()
+	outputPath := outputFile.Name()
+	defer os.Remove(outputPath)
 
 	process, err := os.StartProcess(program, args, &os.ProcAttr{
 		Dir:   dir,
-		Files: []*os.File{os.Stdin, writer, writer},
+		Files: []*os.File{os.Stdin, outputFile, outputFile},
 	})
-	writer.Close()
 	if err != nil {
+		outputFile.Close()
 		return nil, err
 	}
 
-	output, readErr := io.ReadAll(reader)
 	state, waitErr := process.Wait()
+	if _, err := outputFile.Seek(0, 0); err != nil {
+		outputFile.Close()
+		return nil, err
+	}
+	output, readErr := io.ReadAll(outputFile)
+	outputFile.Close()
 	if readErr != nil {
 		return output, readErr
 	}
