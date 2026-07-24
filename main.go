@@ -12,10 +12,12 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -50,6 +52,7 @@ type ClientRequest struct {
 	Target  string `json:"target,omitempty"`
 	Content string `json:"content,omitempty"`
 	Session string `json:"session,omitempty"`
+	Command string `json:"command,omitempty"`
 }
 
 type FileEntry struct {
@@ -371,9 +374,70 @@ func (s *Server) executeRequest(req ClientRequest) ServerResponse {
 		}
 		return ServerResponse{Success: true, Message: "file saved"}
 
+	case "execute":
+		path, err := sanitizePath(s.rootDir, req.Path)
+		if err != nil {
+			return ServerResponse{Success: false, Message: err.Error()}
+		}
+		if strings.TrimSpace(req.Command) == "" {
+			return ServerResponse{Success: false, Message: "command required"}
+		}
+
+		var shell string
+		var args []string
+		if runtime.GOOS == "windows" {
+			shell = os.Getenv("COMSPEC")
+			if shell == "" {
+				shell = "C:\\Windows\\System32\\cmd.exe"
+			}
+			args = []string{shell, "/C", req.Command}
+		} else {
+			shell = "/bin/sh"
+			args = []string{shell, "-c", req.Command}
+		}
+		output, err := runCommand(shell, args, path)
+		message := strings.TrimRight(string(output), "\r\n")
+		if err != nil {
+			if message == "" {
+				message = err.Error()
+			}
+			return ServerResponse{Success: false, Message: message}
+		}
+		return ServerResponse{Success: true, Message: message}
+
 	default:
 		return ServerResponse{Success: false, Message: "unsupported action"}
 	}
+}
+
+func runCommand(program string, args []string, dir string) ([]byte, error) {
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		return nil, err
+	}
+	defer reader.Close()
+
+	process, err := os.StartProcess(program, args, &os.ProcAttr{
+		Dir:   dir,
+		Files: []*os.File{os.Stdin, writer, writer},
+	})
+	writer.Close()
+	if err != nil {
+		return nil, err
+	}
+
+	output, readErr := io.ReadAll(reader)
+	state, waitErr := process.Wait()
+	if readErr != nil {
+		return output, readErr
+	}
+	if waitErr != nil {
+		return output, waitErr
+	}
+	if !state.Success() {
+		return output, fmt.Errorf("command exited with %s", state.String())
+	}
+	return output, nil
 }
 
 func parseBearerToken(header string) string {

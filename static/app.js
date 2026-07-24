@@ -31,6 +31,7 @@ let sortState = {
 	direction: 'asc',
 };
 let openEditorPath = '';
+let socketReady = false;
 
 connectBtn.addEventListener('click', connectSocket);
 upBtn.addEventListener('click', goUp);
@@ -122,17 +123,32 @@ async function connectSocket() {
   ws = new WebSocket(url);
 
   ws.addEventListener('open', () => {
-    statusEl.textContent = 'Connected';
-    setControlsEnabled(true);
-    showOutput('WebSocket connected.');
+    statusEl.textContent = 'Authenticating...';
+    socketReady = false;
+    setControlsEnabled(false);
   });
 
-  ws.addEventListener('message', (event) => {
+  ws.addEventListener('message', async (event) => {
     let data;
     try {
       data = JSON.parse(event.data);
     } catch (err) {
       showOutput('Received: ' + event.data);
+      return;
+    }
+
+    if (!socketReady) {
+      if (!data.success) {
+        statusEl.textContent = 'Authentication failed';
+        showOutput(data.message || 'Authentication failed.');
+        ws.close();
+        return;
+      }
+      socketReady = true;
+      statusEl.textContent = 'Connected';
+      setControlsEnabled(true);
+      const loaded = await loadDirectory(currentPath, { quiet: true });
+      showOutput(loaded ? data.message : 'Connected, but the workspace could not be loaded.');
       return;
     }
 
@@ -150,6 +166,7 @@ async function connectSocket() {
   });
 
   ws.addEventListener('close', () => {
+    socketReady = false;
     statusEl.textContent = 'Disconnected';
     setControlsEnabled(false);
     renderEmpty('Connect to load workspace.');
@@ -157,6 +174,7 @@ async function connectSocket() {
   });
 
   ws.addEventListener('error', () => {
+    socketReady = false;
     statusEl.textContent = 'Error';
     showOutput('WebSocket error.');
   });
@@ -577,8 +595,16 @@ async function executeTypedCommand(command) {
     return true;
   }
 
-  showCommandOutput(command, formatUnknownCommand(action));
-  return false;
+  const response = await sendEncryptedCommand({
+    action: 'execute',
+    path: currentPath,
+    command,
+  });
+  showCommandOutput(command, response.message || (response.success ? '' : 'Command failed.'));
+  if (response.success) {
+    await loadDirectory(currentPath, { quiet: true });
+  }
+  return true;
 }
 
 function splitCommand(command) {
@@ -715,7 +741,7 @@ function base64Encode(bytes) {
 }
 
 function isSocketOpen() {
-  return ws && ws.readyState === WebSocket.OPEN;
+  return socketReady && ws && ws.readyState === WebSocket.OPEN;
 }
 
 function setControlsEnabled(enabled) {
