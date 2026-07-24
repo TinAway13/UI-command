@@ -110,14 +110,6 @@ async function connectSocket() {
     showOutput('Enter a JWT token before connecting.');
     return;
   }
-  if (!window.isSecureContext || !window.crypto?.subtle) {
-    statusEl.textContent = 'Secure connection required';
-    showOutput(
-      'Encrypted commands require HTTPS. Open this UI with https:// (or use localhost during local development).',
-    );
-    return;
-  }
-
   try {
     [serverPublicKey] = await Promise.all([fetchPublicKey(), fetchSystemInfo()]);
   } catch (error) {
@@ -152,9 +144,14 @@ async function connectSocket() {
         return;
       }
       socketReady = true;
-      statusEl.textContent = 'Connected';
+      const encrypted = Boolean(window.isSecureContext && window.crypto?.subtle);
+      statusEl.textContent = encrypted ? 'Connected' : 'Connected (insecure HTTP)';
       setControlsEnabled(true);
-      showOutput('Connected. Loading workspace...');
+      showOutput(
+        encrypted
+          ? 'Connected. Loading workspace...'
+          : 'Connected over insecure HTTP. Commands and credentials are not encrypted. Loading workspace...',
+      );
       const loaded = await loadDirectory(currentPath, { quiet: true });
       showOutput(loaded ? data.message : 'Connected, but the workspace could not be loaded.');
       return;
@@ -629,7 +626,10 @@ async function sendEncryptedCommand(payload) {
   }
 
   try {
-    const ciphertext = await encryptPayload(payload);
+    const message =
+      window.isSecureContext && window.crypto?.subtle
+        ? await encryptPayload(payload)
+        : payload;
     const responsePromise = new Promise((resolve) => {
       const timeout = window.setTimeout(() => {
         pendingResponse = null;
@@ -643,7 +643,7 @@ async function sendEncryptedCommand(payload) {
         resolve(response);
       };
     });
-    ws.send(JSON.stringify(ciphertext));
+    ws.send(JSON.stringify(message));
     return responsePromise;
   } catch (error) {
     pendingResponse = null;

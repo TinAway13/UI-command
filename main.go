@@ -191,22 +191,23 @@ func (s *Server) websocketHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		var encrypted EncryptedMessage
-		if err := json.Unmarshal(msg, &encrypted); err != nil {
-			conn.WriteJSON(ServerResponse{Success: false, Message: "invalid encrypted message format"})
-			continue
-		}
-
-		plaintext, err := s.decryptEnvelope(encrypted)
-		if err != nil {
-			conn.WriteJSON(ServerResponse{Success: false, Message: fmt.Sprintf("decryption failed: %v", err)})
-			continue
-		}
-
 		var request ClientRequest
-		if err := json.Unmarshal(plaintext, &request); err != nil {
-			conn.WriteJSON(ServerResponse{Success: false, Message: "request JSON invalid"})
-			continue
+		if err := json.Unmarshal(msg, &request); err != nil || request.Action == "" {
+			var encrypted EncryptedMessage
+			if err := json.Unmarshal(msg, &encrypted); err != nil {
+				conn.WriteJSON(ServerResponse{Success: false, Message: "invalid message format"})
+				continue
+			}
+
+			plaintext, err := s.decryptEnvelope(encrypted)
+			if err != nil {
+				conn.WriteJSON(ServerResponse{Success: false, Message: fmt.Sprintf("decryption failed: %v", err)})
+				continue
+			}
+			if err := json.Unmarshal(plaintext, &request); err != nil {
+				conn.WriteJSON(ServerResponse{Success: false, Message: "request JSON invalid"})
+				continue
+			}
 		}
 
 		response := s.executeRequest(request)
