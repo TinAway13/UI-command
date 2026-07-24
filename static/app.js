@@ -110,6 +110,13 @@ async function connectSocket() {
     showOutput('Enter a JWT token before connecting.');
     return;
   }
+  if (!window.isSecureContext || !window.crypto?.subtle) {
+    statusEl.textContent = 'Secure connection required';
+    showOutput(
+      'Encrypted commands require HTTPS. Open this UI with https:// (or use localhost during local development).',
+    );
+    return;
+  }
 
   try {
     [serverPublicKey] = await Promise.all([fetchPublicKey(), fetchSystemInfo()]);
@@ -621,12 +628,30 @@ async function sendEncryptedCommand(payload) {
     return { success: false, message: 'A command is already running.' };
   }
 
-  const ciphertext = await encryptPayload(payload);
-  const responsePromise = new Promise((resolve) => {
-    pendingResponse = resolve;
-  });
-  ws.send(JSON.stringify(ciphertext));
-  return responsePromise;
+  try {
+    const ciphertext = await encryptPayload(payload);
+    const responsePromise = new Promise((resolve) => {
+      const timeout = window.setTimeout(() => {
+        pendingResponse = null;
+        resolve({
+          success: false,
+          message: 'Server did not respond within 15 seconds. Check the WebSocket connection and server logs.',
+        });
+      }, 15000);
+      pendingResponse = (response) => {
+        window.clearTimeout(timeout);
+        resolve(response);
+      };
+    });
+    ws.send(JSON.stringify(ciphertext));
+    return responsePromise;
+  } catch (error) {
+    pendingResponse = null;
+    return {
+      success: false,
+      message: `Unable to encrypt or send command: ${error.message || error}`,
+    };
+  }
 }
 
 async function writeFileInChunks(path, content) {
