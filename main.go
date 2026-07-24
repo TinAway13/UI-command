@@ -121,7 +121,8 @@ func main() {
 	http.HandleFunc("/publicKey", s.publicKeyHandler)
 	http.HandleFunc("/systemInfo", s.systemInfoHandler)
 	http.HandleFunc("/ws", s.websocketHandler)
-	http.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.Dir("static"))))
+	staticFiles := http.StripPrefix("/static/", http.FileServer(http.Dir("static")))
+	http.Handle("/static/", noCache(staticFiles))
 
 	log.Printf("starting server on http://localhost:8080")
 	log.Printf("start path: %s", absRoot)
@@ -134,7 +135,15 @@ func (s *Server) indexHandler(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	w.Header().Set("Cache-Control", "no-store")
 	http.ServeFile(w, r, "static/index.html")
+}
+
+func noCache(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) publicKeyHandler(w http.ResponseWriter, r *http.Request) {

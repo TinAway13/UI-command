@@ -147,6 +147,7 @@ async function connectSocket() {
       socketReady = true;
       statusEl.textContent = 'Connected';
       setControlsEnabled(true);
+      showOutput('Connected. Loading workspace...');
       const loaded = await loadDirectory(currentPath, { quiet: true });
       showOutput(loaded ? data.message : 'Connected, but the workspace could not be loaded.');
       return;
