@@ -24,6 +24,9 @@
         <div class="toolbar">
           <button id="upBtn" type="button" disabled title="Go up">Up</button>
           <button id="refreshBtn" type="button" disabled title="Refresh">Refresh</button>
+          <button id="downloadBtn" type="button" disabled title="Download selected file or folder">Download</button>
+          <button id="uploadBtn" type="button" disabled title="Upload files to this folder">Upload</button>
+          <input id="uploadFileInput" type="file" multiple hidden />
         </div>
       </div>
       <div class="path-bar">
@@ -64,12 +67,14 @@
     <button type="button" data-menu-action="open">Open</button>
     <button type="button" data-menu-action="read-file">Read File</button>
     <button type="button" data-menu-action="edit-file">Edit File</button>
+    <button type="button" data-menu-action="download">Download</button>
+    <button type="button" data-menu-action="upload">Upload File Here</button>
     <button type="button" data-menu-action="new-folder">New Folder</button>
     <button type="button" data-menu-action="rename">Rename</button>
     <button type="button" data-menu-action="delete">Delete</button>
     <button type="button" data-menu-action="refresh">Refresh</button>
   </nav>
 
-  <script src="/static/app.js?v=6"></script>
+  <script src="/static/app.js?v=7"></script>
 </body>
 </html>

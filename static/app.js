@@ -9,6 +9,9 @@ const commandInput = document.getElementById('commandInput');
 const commandBtn = document.getElementById('commandBtn');
 const upBtn = document.getElementById('upBtn');
 const refreshBtn = document.getElementById('refreshBtn');
+const downloadBtn = document.getElementById('downloadBtn');
+const uploadBtn = document.getElementById('uploadBtn');
+const uploadFileInput = document.getElementById('uploadFileInput');
 const contextMenu = document.getElementById('contextMenu');
 const editorPanel = document.getElementById('editorPanel');
 const editorTitle = document.getElementById('editorTitle');
@@ -36,10 +39,14 @@ let connectionAttempt = 0;
 let transportMode = 'none';
 let authToken = '';
 let httpRequestRunning = false;
+let fileTransferRunning = false;
 
 connectBtn.addEventListener('click', connectSocket);
 upBtn.addEventListener('click', goUp);
 refreshBtn.addEventListener('click', () => loadDirectory(currentPath));
+downloadBtn.addEventListener('click', () => downloadEntry(selectedEntry));
+uploadBtn.addEventListener('click', () => uploadFileInput.click());
+uploadFileInput.addEventListener('change', uploadSelectedFiles);
 commandForm.addEventListener('submit', runTypedCommand);
 saveFileBtn.addEventListener('click', saveOpenFile);
 closeEditorBtn.addEventListener('click', closeEditor);
@@ -312,6 +319,8 @@ async function activateHTTPTransport(attempt) {
 
   currentPath = targetPath;
   currentEntries = response.entries || [];
+  selectEntry(null);
+  contextEntry = null;
   const secureHTTP = window.location.protocol === 'https:';
   statusEl.textContent = secureHTTP ? 'Connected (HTTP)' : 'Connected (insecure HTTP)';
   setControlsEnabled(true);
@@ -337,7 +346,7 @@ async function loadDirectory(path, options = {}) {
 	}
 
 	currentPath = targetPath;
-  selectedEntry = null;
+  selectEntry(null);
   contextEntry = null;
   renderBreadcrumb();
   currentEntries = response.entries || [];
@@ -422,6 +431,95 @@ async function deleteEntry(entry) {
   }
 }
 
+async function downloadEntry(entry) {
+  if (!entry || !isTransportReady() || fileTransferRunning) {
+    return;
+  }
+
+  fileTransferRunning = true;
+  downloadBtn.disabled = true;
+  const path = joinPath(currentPath, entry.name);
+  showOutput(entry.isDir ? `Creating ${entry.name}.zip with 7z...` : `Downloading ${entry.name}...`);
+
+  try {
+    const response = await fetch(`/api/download?path=${encodeURIComponent(path)}`, {
+      method: 'GET',
+      cache: 'no-store',
+      headers: { Authorization: `Bearer ${authToken}` },
+    });
+    if (!response.ok) {
+      const message = (await response.text()).trim();
+      showOutput(message || `Download failed (${response.status}).`);
+      return;
+    }
+
+    const blob = await response.blob();
+    const objectURL = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = objectURL;
+    link.download = entry.isDir ? `${entry.name}.zip` : entry.name;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(objectURL), 1000);
+    showOutput(`Downloaded: ${link.download}`);
+  } catch (error) {
+    showOutput(`Download failed: ${error.message || error}`);
+  } finally {
+    fileTransferRunning = false;
+    downloadBtn.disabled = !selectedEntry || !isTransportReady();
+  }
+}
+
+async function uploadSelectedFiles() {
+  const files = Array.from(uploadFileInput.files || []);
+  uploadFileInput.value = '';
+  if (!files.length || !isTransportReady() || fileTransferRunning) {
+    return;
+  }
+
+  fileTransferRunning = true;
+  uploadBtn.disabled = true;
+  const destination = currentPath;
+  let uploaded = 0;
+
+  try {
+    for (const [index, file] of files.entries()) {
+      showOutput(`Uploading ${index + 1}/${files.length}: ${file.name}`);
+      const targetPath = joinPath(destination, file.name);
+      const response = await fetch(`/api/upload?path=${encodeURIComponent(targetPath)}`, {
+        method: 'POST',
+        cache: 'no-store',
+        headers: {
+          Authorization: `Bearer ${authToken}`,
+          'Content-Type': 'application/octet-stream',
+        },
+        body: file,
+      });
+
+      let result;
+      try {
+        result = await response.json();
+      } catch (error) {
+        result = { success: false, message: `Upload returned an invalid response (${response.status}).` };
+      }
+      if (!response.ok || !result.success) {
+        showOutput(result.message || `Upload failed for ${file.name}.`);
+        return;
+      }
+      uploaded += 1;
+    }
+
+    await loadDirectory(destination, { quiet: true });
+    showOutput(`Uploaded ${uploaded} file${uploaded === 1 ? '' : 's'} to ${toSystemPath(destination)}.`);
+  } catch (error) {
+    showOutput(`Upload failed: ${error.message || error}`);
+  } finally {
+    fileTransferRunning = false;
+    uploadBtn.disabled = !isTransportReady();
+  }
+}
+
 function runMenuAction(action) {
   const entry = contextEntry || selectedEntry;
   if (action === 'open' && entry?.isDir) {
@@ -432,6 +530,12 @@ function runMenuAction(action) {
   }
   if (action === 'edit-file') {
     openFileForEdit(entry);
+  }
+  if (action === 'download') {
+    downloadEntry(entry);
+  }
+  if (action === 'upload') {
+    uploadFileInput.click();
   }
   if (action === 'new-folder') {
     createFolder(currentPath);
@@ -531,6 +635,7 @@ function renderEmpty(message) {
 
 function selectEntry(entry) {
   selectedEntry = entry;
+  downloadBtn.disabled = !entry || !isTransportReady() || fileTransferRunning;
   document.querySelectorAll('.file-row.is-selected').forEach((row) => {
     row.classList.remove('is-selected');
   });
@@ -546,10 +651,12 @@ function showContextMenu(x, y, entry) {
   contextMenu.querySelector('[data-menu-action="open"]').disabled = !entry?.isDir;
   contextMenu.querySelector('[data-menu-action="read-file"]').disabled = !hasEntry || entry.isDir;
   contextMenu.querySelector('[data-menu-action="edit-file"]').disabled = !hasEntry || entry.isDir;
+  contextMenu.querySelector('[data-menu-action="download"]').disabled = !hasEntry || fileTransferRunning;
+  contextMenu.querySelector('[data-menu-action="upload"]').disabled = !isTransportReady() || fileTransferRunning;
   contextMenu.querySelector('[data-menu-action="rename"]').disabled = !hasEntry;
   contextMenu.querySelector('[data-menu-action="delete"]').disabled = !hasEntry;
   contextMenu.style.left = `${Math.min(x, window.innerWidth - 190)}px`;
-  contextMenu.style.top = `${Math.min(y, window.innerHeight - 220)}px`;
+  contextMenu.style.top = `${Math.min(y, window.innerHeight - 300)}px`;
   contextMenu.classList.add('is-open');
   contextMenu.setAttribute('aria-hidden', 'false');
 }
@@ -1005,6 +1112,8 @@ function setControlsEnabled(enabled) {
 	commandInput.disabled = !enabled;
 	commandBtn.disabled = !enabled;
 	upBtn.disabled = !enabled || parentPath(currentPath) === currentPath;
+	downloadBtn.disabled = !enabled || !selectedEntry || fileTransferRunning;
+	uploadBtn.disabled = !enabled || fileTransferRunning;
 	if (!enabled) {
 		currentPathText.textContent = '-';
 	}

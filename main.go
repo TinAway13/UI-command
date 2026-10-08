@@ -14,8 +14,10 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"mime"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -29,6 +31,7 @@ const defaultJWTSecret = "change_this_secret_to_a_strong_value"
 const defaultRootDir = "."
 const maxReadFileBytes = 2 * 1024 * 1024
 const maxWebSocketMessageBytes = 4 * 1024 * 1024
+const maxUploadBytes = 1024 * 1024 * 1024
 const webSocketPingInterval = 20 * time.Second
 const webSocketWriteTimeout = 10 * time.Second
 
@@ -124,6 +127,8 @@ func main() {
 	http.HandleFunc("/publicKey", s.publicKeyHandler)
 	http.HandleFunc("/systemInfo", s.systemInfoHandler)
 	http.HandleFunc("/api/command", s.commandHandler)
+	http.HandleFunc("/api/download", s.downloadHandler)
+	http.HandleFunc("/api/upload", s.uploadHandler)
 	http.HandleFunc("/ws", s.websocketHandler)
 	staticFiles := http.StripPrefix("/static/", http.FileServer(http.Dir("static")))
 	http.Handle("/static/", noCache(staticFiles))
@@ -204,6 +209,169 @@ func (s *Server) commandHandler(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewEncoder(w).Encode(s.executeRequest(request)); err != nil {
 		log.Printf("HTTP command response failed for %s: %v", r.RemoteAddr, err)
 	}
+}
+
+func (s *Server) downloadHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "GET required", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := s.validateToken(parseBearerToken(r.Header.Get("Authorization"))); err != nil {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	path, err := sanitizePath(s.rootDir, r.URL.Query().Get("path"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("download failed: %v", err), http.StatusNotFound)
+		return
+	}
+
+	if info.IsDir() {
+		s.serveFolderArchive(w, r, path, info)
+		return
+	}
+	s.serveDownloadFile(w, r, path, info.Name(), info.ModTime())
+}
+
+func (s *Server) serveFolderArchive(w http.ResponseWriter, r *http.Request, path string, info os.FileInfo) {
+	archive, err := os.CreateTemp("", "ui-command-download-*.zip")
+	if err != nil {
+		http.Error(w, fmt.Sprintf("create archive failed: %v", err), http.StatusInternalServerError)
+		return
+	}
+	archivePath := archive.Name()
+	if err := archive.Close(); err != nil {
+		os.Remove(archivePath)
+		http.Error(w, fmt.Sprintf("create archive failed: %v", err), http.StatusInternalServerError)
+		return
+	}
+	if err := os.Remove(archivePath); err != nil {
+		http.Error(w, fmt.Sprintf("prepare archive failed: %v", err), http.StatusInternalServerError)
+		return
+	}
+	defer os.Remove(archivePath)
+
+	sevenZipCommand := os.Getenv("SEVEN_ZIP_COMMAND")
+	if sevenZipCommand == "" {
+		sevenZipCommand = "7z"
+	}
+	sevenZipPath, err := exec.LookPath(sevenZipCommand)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("folder download failed: %s command was not found", sevenZipCommand), http.StatusInternalServerError)
+		return
+	}
+	command := exec.Command(sevenZipPath, "a", "-tzip", "-mx=5", archivePath, "--", filepath.Base(path))
+	command.Dir = filepath.Dir(path)
+	if output, err := command.CombinedOutput(); err != nil {
+		log.Printf("7z archive failed for %s: %v: %s", path, err, strings.TrimSpace(string(output)))
+		http.Error(w, "folder download failed: 7z could not create the ZIP archive", http.StatusInternalServerError)
+		return
+	}
+
+	s.serveDownloadFile(w, r, archivePath, info.Name()+".zip", info.ModTime())
+}
+
+func (s *Server) serveDownloadFile(w http.ResponseWriter, r *http.Request, path, downloadName string, modTime time.Time) {
+	file, err := os.Open(path)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("download failed: %v", err), http.StatusInternalServerError)
+		return
+	}
+	defer file.Close()
+
+	disposition := mime.FormatMediaType("attachment", map[string]string{"filename": downloadName})
+	w.Header().Set("Content-Disposition", disposition)
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	http.ServeContent(w, r, downloadName, modTime, file)
+}
+
+func (s *Server) uploadHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		json.NewEncoder(w).Encode(ServerResponse{Success: false, Message: "POST required"})
+		return
+	}
+	if err := s.validateToken(parseBearerToken(r.Header.Get("Authorization"))); err != nil {
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(ServerResponse{Success: false, Message: "unauthorized"})
+		return
+	}
+	if r.ContentLength > maxUploadBytes {
+		w.WriteHeader(http.StatusRequestEntityTooLarge)
+		json.NewEncoder(w).Encode(ServerResponse{Success: false, Message: "upload exceeds the 1 GiB limit"})
+		return
+	}
+
+	targetPath, err := sanitizePath(s.rootDir, r.URL.Query().Get("path"))
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(ServerResponse{Success: false, Message: err.Error()})
+		return
+	}
+	if info, err := os.Stat(targetPath); err == nil && info.IsDir() {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(ServerResponse{Success: false, Message: "cannot upload over a folder"})
+		return
+	}
+
+	tempFile, err := os.CreateTemp(filepath.Dir(targetPath), "."+filepath.Base(targetPath)+".upload-*")
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(ServerResponse{Success: false, Message: fmt.Sprintf("upload failed: %v", err)})
+		return
+	}
+	tempPath := tempFile.Name()
+	completed := false
+	defer func() {
+		tempFile.Close()
+		if !completed {
+			os.Remove(tempPath)
+		}
+	}()
+
+	r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes)
+	written, copyErr := io.Copy(tempFile, r.Body)
+	if copyErr != nil {
+		status := http.StatusBadRequest
+		var maxBytesError *http.MaxBytesError
+		if errors.As(copyErr, &maxBytesError) {
+			status = http.StatusRequestEntityTooLarge
+		}
+		w.WriteHeader(status)
+		json.NewEncoder(w).Encode(ServerResponse{Success: false, Message: fmt.Sprintf("upload failed: %v", copyErr)})
+		return
+	}
+	if err := tempFile.Sync(); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(ServerResponse{Success: false, Message: fmt.Sprintf("upload failed: %v", err)})
+		return
+	}
+	if err := tempFile.Close(); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(ServerResponse{Success: false, Message: fmt.Sprintf("upload failed: %v", err)})
+		return
+	}
+	if err := os.Rename(tempPath, targetPath); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(ServerResponse{Success: false, Message: fmt.Sprintf("upload failed: %v", err)})
+		return
+	}
+	completed = true
+	json.NewEncoder(w).Encode(ServerResponse{
+		Success: true,
+		Message: fmt.Sprintf("uploaded %s (%d bytes)", filepath.Base(targetPath), written),
+	})
 }
 
 func (s *Server) websocketHandler(w http.ResponseWriter, r *http.Request) {
