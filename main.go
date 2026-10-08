@@ -28,6 +28,9 @@ import (
 const defaultJWTSecret = "change_this_secret_to_a_strong_value"
 const defaultRootDir = "."
 const maxReadFileBytes = 2 * 1024 * 1024
+const maxWebSocketMessageBytes = 4 * 1024 * 1024
+const webSocketPingInterval = 20 * time.Second
+const webSocketWriteTimeout = 10 * time.Second
 
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true },
@@ -124,10 +127,10 @@ func main() {
 	staticFiles := http.StripPrefix("/static/", http.FileServer(http.Dir("static")))
 	http.Handle("/static/", noCache(staticFiles))
 
-	log.Printf("starting server on http://localhost:8080")
+	log.Printf("starting server on http://localhost:8082")
 	log.Printf("start path: %s", absRoot)
 	log.Printf("JWT token valid for 60 minutes: %s", startupToken)
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	log.Fatal(http.ListenAndServe(":8082", nil))
 }
 
 func (s *Server) indexHandler(w http.ResponseWriter, r *http.Request) {
@@ -147,16 +150,22 @@ func noCache(next http.Handler) http.Handler {
 }
 
 func (s *Server) publicKeyHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(PublicKeyResponse{PublicKey: string(s.publicKey)})
+	if err := json.NewEncoder(w).Encode(PublicKeyResponse{PublicKey: string(s.publicKey)}); err != nil {
+		log.Printf("public key response failed: %v", err)
+	}
 }
 
 func (s *Server) systemInfoHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(SystemInfoResponse{
+	if err := json.NewEncoder(w).Encode(SystemInfoResponse{
 		RootDir:   s.rootDir,
 		Separator: string(os.PathSeparator),
-	})
+	}); err != nil {
+		log.Printf("system info response failed: %v", err)
+	}
 }
 
 func (s *Server) websocketHandler(w http.ResponseWriter, r *http.Request) {
@@ -176,18 +185,39 @@ func (s *Server) websocketHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer conn.Close()
+	conn.SetReadLimit(maxWebSocketMessageBytes)
+	remoteAddr := r.RemoteAddr
+
+	done := make(chan struct{})
+	defer close(done)
+	go s.keepWebSocketAlive(conn, remoteAddr, done)
+
+	writeResponse := func(response ServerResponse) bool {
+		if err := conn.SetWriteDeadline(time.Now().Add(webSocketWriteTimeout)); err != nil {
+			log.Printf("websocket write deadline failed for %s: %v", remoteAddr, err)
+			return false
+		}
+		if err := conn.WriteJSON(response); err != nil {
+			log.Printf("websocket write failed for %s: %v", remoteAddr, err)
+			return false
+		}
+		return true
+	}
 
 	resp := ServerResponse{Success: true, Message: "authenticated, socket ready"}
-	conn.WriteJSON(resp)
+	if !writeResponse(resp) {
+		return
+	}
+	log.Printf("websocket client connected: %s", remoteAddr)
 
 	for {
 		_, msg, err := conn.ReadMessage()
 		if err != nil {
 			if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
-				log.Printf("websocket client disconnected")
+				log.Printf("websocket client disconnected: %s", remoteAddr)
 				return
 			}
-			log.Printf("read error: %v", err)
+			log.Printf("websocket read error for %s: %v", remoteAddr, err)
 			return
 		}
 
@@ -195,23 +225,50 @@ func (s *Server) websocketHandler(w http.ResponseWriter, r *http.Request) {
 		if err := json.Unmarshal(msg, &request); err != nil || request.Action == "" {
 			var encrypted EncryptedMessage
 			if err := json.Unmarshal(msg, &encrypted); err != nil {
-				conn.WriteJSON(ServerResponse{Success: false, Message: "invalid message format"})
+				if !writeResponse(ServerResponse{Success: false, Message: "invalid message format"}) {
+					return
+				}
 				continue
 			}
 
 			plaintext, err := s.decryptEnvelope(encrypted)
 			if err != nil {
-				conn.WriteJSON(ServerResponse{Success: false, Message: fmt.Sprintf("decryption failed: %v", err)})
+				if !writeResponse(ServerResponse{Success: false, Message: fmt.Sprintf("decryption failed: %v", err)}) {
+					return
+				}
 				continue
 			}
 			if err := json.Unmarshal(plaintext, &request); err != nil {
-				conn.WriteJSON(ServerResponse{Success: false, Message: "request JSON invalid"})
+				if !writeResponse(ServerResponse{Success: false, Message: "request JSON invalid"}) {
+					return
+				}
 				continue
 			}
 		}
 
 		response := s.executeRequest(request)
-		conn.WriteJSON(response)
+		if !writeResponse(response) {
+			return
+		}
+	}
+}
+
+func (s *Server) keepWebSocketAlive(conn *websocket.Conn, remoteAddr string, done <-chan struct{}) {
+	ticker := time.NewTicker(webSocketPingInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			deadline := time.Now().Add(webSocketWriteTimeout)
+			if err := conn.WriteControl(websocket.PingMessage, nil, deadline); err != nil {
+				log.Printf("websocket ping failed for %s: %v", remoteAddr, err)
+				conn.Close()
+				return
+			}
+		case <-done:
+			return
+		}
 	}
 }
 

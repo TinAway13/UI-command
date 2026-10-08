@@ -17,7 +17,7 @@ const fileEditor = document.getElementById('fileEditor');
 const saveFileBtn = document.getElementById('saveFileBtn');
 const closeEditorBtn = document.getElementById('closeEditorBtn');
 
-let ws;
+let ws = null;
 let serverPublicKey;
 let rootDir = '';
 let pathSeparator = '/';
@@ -32,6 +32,7 @@ let sortState = {
 };
 let openEditorPath = '';
 let socketReady = false;
+let connectionAttempt = 0;
 
 connectBtn.addEventListener('click', connectSocket);
 upBtn.addEventListener('click', goUp);
@@ -110,24 +111,83 @@ async function connectSocket() {
     showOutput('Enter a JWT token before connecting.');
     return;
   }
+
+  const attempt = ++connectionAttempt;
+  const previousSocket = ws;
+  ws = null;
+  socketReady = false;
+  connectBtn.disabled = true;
+  statusEl.textContent = 'Connecting...';
+  setControlsEnabled(false);
+
+  if (previousSocket) {
+    resolvePending(
+      { success: false, message: 'Connection replaced by a new connection.' },
+      previousSocket,
+    );
+    if (
+      previousSocket.readyState === WebSocket.CONNECTING ||
+      previousSocket.readyState === WebSocket.OPEN
+    ) {
+      try {
+        previousSocket.close(1000, 'Reconnecting');
+      } catch (error) {
+        // A CONNECTING socket can finish closing asynchronously.
+      }
+    }
+  }
+
+  let publicKey;
   try {
-    [serverPublicKey] = await Promise.all([fetchPublicKey(), fetchSystemInfo()]);
+    [publicKey] = await Promise.all([fetchPublicKey(), fetchSystemInfo()]);
   } catch (error) {
+    if (attempt !== connectionAttempt) {
+      return;
+    }
+    connectBtn.disabled = false;
+    statusEl.textContent = 'Connection failed';
     showOutput('Unable to load startup data: ' + error);
     return;
   }
 
+  if (attempt !== connectionAttempt) {
+    return;
+  }
+  serverPublicKey = publicKey;
+
   const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
   const url = `${protocol}://${window.location.host}/ws?token=${encodeURIComponent(token)}`;
-  ws = new WebSocket(url);
+  let socket;
+  try {
+    socket = new WebSocket(url);
+  } catch (error) {
+    connectBtn.disabled = false;
+    statusEl.textContent = 'Connection failed';
+    showOutput(`Unable to create WebSocket: ${error.message || error}`);
+    return;
+  }
+  let authenticated = false;
+  const connectionTimeout = window.setTimeout(() => {
+    if (socket !== ws || authenticated) {
+      return;
+    }
+    showOutput('WebSocket connection timed out.');
+    socket.close();
+  }, 10000);
+  ws = socket;
 
-  ws.addEventListener('open', () => {
+  socket.addEventListener('open', () => {
+    if (socket !== ws) {
+      return;
+    }
     statusEl.textContent = 'Authenticating...';
-    socketReady = false;
-    setControlsEnabled(false);
   });
 
-  ws.addEventListener('message', async (event) => {
+  socket.addEventListener('message', async (event) => {
+    if (socket !== ws) {
+      return;
+    }
+
     let data;
     try {
       data = JSON.parse(event.data);
@@ -136,14 +196,20 @@ async function connectSocket() {
       return;
     }
 
-    if (!socketReady) {
+    if (!authenticated) {
       if (!data.success) {
+        window.clearTimeout(connectionTimeout);
+        connectBtn.disabled = false;
         statusEl.textContent = 'Authentication failed';
         showOutput(data.message || 'Authentication failed.');
-        ws.close();
+        socket.close(1008, 'Authentication failed');
         return;
       }
+
+      window.clearTimeout(connectionTimeout);
+      authenticated = true;
       socketReady = true;
+      connectBtn.disabled = false;
       const encrypted = Boolean(window.isSecureContext && window.crypto?.subtle);
       statusEl.textContent = encrypted ? 'Connected' : 'Connected (insecure HTTP)';
       setControlsEnabled(true);
@@ -153,14 +219,13 @@ async function connectSocket() {
           : 'Connected over insecure HTTP. Commands and credentials are not encrypted. Loading workspace...',
       );
       const loaded = await loadDirectory(currentPath, { quiet: true });
-      showOutput(loaded ? data.message : 'Connected, but the workspace could not be loaded.');
+      if (socket === ws && authenticated && socketReady) {
+        showOutput(loaded ? data.message : 'Connected, but the workspace could not be loaded.');
+      }
       return;
     }
 
-    if (pendingResponse) {
-      const resolve = pendingResponse;
-      pendingResponse = null;
-      resolve(data);
+    if (resolvePending(data, socket)) {
       return;
     }
 
@@ -170,17 +235,37 @@ async function connectSocket() {
     showOutput(JSON.stringify(data, null, 2));
   });
 
-  ws.addEventListener('close', () => {
+  socket.addEventListener('close', (event) => {
+    window.clearTimeout(connectionTimeout);
+    if (socket !== ws) {
+      return;
+    }
+
+    resolvePending(
+      { success: false, message: `WebSocket closed before the server responded (code ${event.code}).` },
+      socket,
+    );
+    ws = null;
     socketReady = false;
+    connectBtn.disabled = false;
     statusEl.textContent = 'Disconnected';
     setControlsEnabled(false);
     renderEmpty('Connect to load workspace.');
-    showOutput('WebSocket closed.');
+    showOutput(
+      event.code === 1000
+        ? 'WebSocket closed.'
+        : `WebSocket closed unexpectedly (code ${event.code}).`,
+    );
   });
 
-  ws.addEventListener('error', () => {
+  socket.addEventListener('error', () => {
+    if (socket !== ws) {
+      return;
+    }
     socketReady = false;
+    connectBtn.disabled = false;
     statusEl.textContent = 'Error';
+    setControlsEnabled(false);
     showOutput('WebSocket error.');
   });
 }
@@ -494,7 +579,7 @@ function entryFromRow(row) {
 }
 
 async function fetchPublicKey() {
-  const response = await fetch('/publicKey');
+  const response = await fetch('/publicKey', { cache: 'no-store' });
   if (!response.ok) {
     throw new Error(response.statusText);
   }
@@ -503,7 +588,7 @@ async function fetchPublicKey() {
 }
 
 async function fetchSystemInfo() {
-  const response = await fetch('/systemInfo');
+  const response = await fetch('/systemInfo', { cache: 'no-store' });
   if (!response.ok) {
     throw new Error(response.statusText);
   }
@@ -618,7 +703,9 @@ function splitCommand(command) {
 }
 
 async function sendEncryptedCommand(payload) {
-  if (!isSocketOpen()) {
+  const socket = ws;
+  const publicKey = serverPublicKey;
+  if (!isSocketOpen(socket)) {
     return { success: false, message: 'Socket is not open. Connect first.' };
   }
   if (pendingResponse) {
@@ -628,25 +715,41 @@ async function sendEncryptedCommand(payload) {
   try {
     const message =
       window.isSecureContext && window.crypto?.subtle
-        ? await encryptPayload(payload)
+        ? await encryptPayload(payload, publicKey)
         : payload;
-    const responsePromise = new Promise((resolve) => {
-      const timeout = window.setTimeout(() => {
+
+    if (!isSocketOpen(socket)) {
+      return { success: false, message: 'Connection changed before the command could be sent.' };
+    }
+
+    return new Promise((resolve) => {
+      const pending = {
+        socket,
+        resolve,
+        timeout: null,
+      };
+      pending.timeout = window.setTimeout(() => {
+        if (pendingResponse !== pending) {
+          return;
+        }
         pendingResponse = null;
         resolve({
           success: false,
           message: 'Server did not respond within 15 seconds. Check the WebSocket connection and server logs.',
         });
       }, 15000);
-      pendingResponse = (response) => {
-        window.clearTimeout(timeout);
-        resolve(response);
-      };
+      pendingResponse = pending;
+
+      try {
+        socket.send(JSON.stringify(message));
+      } catch (error) {
+        resolvePending(
+          { success: false, message: `Unable to send command: ${error.message || error}` },
+          socket,
+        );
+      }
     });
-    ws.send(JSON.stringify(message));
-    return responsePromise;
   } catch (error) {
-    pendingResponse = null;
     return {
       success: false,
       message: `Unable to encrypt or send command: ${error.message || error}`,
@@ -694,7 +797,7 @@ function createSessionId() {
 	return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
 }
 
-async function encryptPayload(payload) {
+async function encryptPayload(payload, publicKeyPEM) {
   const encoder = new TextEncoder();
   const plaintext = encoder.encode(JSON.stringify(payload));
   const aesKey = await window.crypto.subtle.generateKey(
@@ -715,7 +818,7 @@ async function encryptPayload(payload) {
     plaintext,
   );
   const rawKey = await window.crypto.subtle.exportKey('raw', aesKey);
-  const publicKey = await importPublicKey(serverPublicKey);
+  const publicKey = await importPublicKey(publicKeyPEM);
   const encryptedKey = await window.crypto.subtle.encrypt(
     {
       name: 'RSA-OAEP',
@@ -766,8 +869,19 @@ function base64Encode(bytes) {
   return btoa(binary);
 }
 
-function isSocketOpen() {
-  return socketReady && ws && ws.readyState === WebSocket.OPEN;
+function resolvePending(response, socket) {
+  const pending = pendingResponse;
+  if (!pending || (socket && pending.socket !== socket)) {
+    return false;
+  }
+  pendingResponse = null;
+  window.clearTimeout(pending.timeout);
+  pending.resolve(response);
+  return true;
+}
+
+function isSocketOpen(socket = ws) {
+  return socket === ws && socketReady && socket?.readyState === WebSocket.OPEN;
 }
 
 function setControlsEnabled(enabled) {
