@@ -34,6 +34,7 @@ const maxWebSocketMessageBytes = 4 * 1024 * 1024
 const maxUploadBytes = 1024 * 1024 * 1024
 const webSocketPingInterval = 20 * time.Second
 const webSocketWriteTimeout = 10 * time.Second
+const jwtTokenTTL = time.Hour
 
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true },
@@ -111,7 +112,7 @@ func main() {
 		log.Fatalf("unable to generate server RSA key pair: %v", err)
 	}
 
-	startupToken, err := generateJWT(jwtSecret, time.Hour)
+	startupToken, err := generateJWT(jwtSecret, jwtTokenTTL)
 	if err != nil {
 		log.Fatalf("unable to generate startup JWT token: %v", err)
 	}
@@ -136,7 +137,22 @@ func main() {
 	log.Printf("starting server on http://localhost:8082")
 	log.Printf("start path: %s", absRoot)
 	log.Printf("JWT token valid for 60 minutes: %s", startupToken)
+	go logJWTRenewals(jwtSecret, jwtTokenTTL)
 	log.Fatal(http.ListenAndServe(":8082", nil))
+}
+
+func logJWTRenewals(secret string, ttl time.Duration) {
+	ticker := time.NewTicker(ttl)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		token, err := generateJWT(secret, ttl)
+		if err != nil {
+			log.Printf("unable to renew JWT token: %v", err)
+			continue
+		}
+		log.Printf("JWT token renewed and valid for 60 minutes: %s", token)
+	}
 }
 
 func (s *Server) indexHandler(w http.ResponseWriter, r *http.Request) {
