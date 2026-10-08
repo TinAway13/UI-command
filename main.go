@@ -123,6 +123,7 @@ func main() {
 	http.HandleFunc("/", s.indexHandler)
 	http.HandleFunc("/publicKey", s.publicKeyHandler)
 	http.HandleFunc("/systemInfo", s.systemInfoHandler)
+	http.HandleFunc("/api/command", s.commandHandler)
 	http.HandleFunc("/ws", s.websocketHandler)
 	staticFiles := http.StripPrefix("/static/", http.FileServer(http.Dir("static")))
 	http.Handle("/static/", noCache(staticFiles))
@@ -165,6 +166,43 @@ func (s *Server) systemInfoHandler(w http.ResponseWriter, r *http.Request) {
 		Separator: string(os.PathSeparator),
 	}); err != nil {
 		log.Printf("system info response failed: %v", err)
+	}
+}
+
+func (s *Server) commandHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		json.NewEncoder(w).Encode(ServerResponse{Success: false, Message: "POST required"})
+		return
+	}
+
+	token := parseBearerToken(r.Header.Get("Authorization"))
+	if err := s.validateToken(token); err != nil {
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(ServerResponse{Success: false, Message: "unauthorized"})
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, maxWebSocketMessageBytes)
+	message, err := io.ReadAll(r.Body)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(ServerResponse{Success: false, Message: fmt.Sprintf("request read failed: %v", err)})
+		return
+	}
+
+	request, err := s.decodeClientRequest(message)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(ServerResponse{Success: false, Message: err.Error()})
+		return
+	}
+
+	if err := json.NewEncoder(w).Encode(s.executeRequest(request)); err != nil {
+		log.Printf("HTTP command response failed for %s: %v", r.RemoteAddr, err)
 	}
 }
 
@@ -221,29 +259,12 @@ func (s *Server) websocketHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		var request ClientRequest
-		if err := json.Unmarshal(msg, &request); err != nil || request.Action == "" {
-			var encrypted EncryptedMessage
-			if err := json.Unmarshal(msg, &encrypted); err != nil {
-				if !writeResponse(ServerResponse{Success: false, Message: "invalid message format"}) {
-					return
-				}
-				continue
+		request, err := s.decodeClientRequest(msg)
+		if err != nil {
+			if !writeResponse(ServerResponse{Success: false, Message: err.Error()}) {
+				return
 			}
-
-			plaintext, err := s.decryptEnvelope(encrypted)
-			if err != nil {
-				if !writeResponse(ServerResponse{Success: false, Message: fmt.Sprintf("decryption failed: %v", err)}) {
-					return
-				}
-				continue
-			}
-			if err := json.Unmarshal(plaintext, &request); err != nil {
-				if !writeResponse(ServerResponse{Success: false, Message: "request JSON invalid"}) {
-					return
-				}
-				continue
-			}
+			continue
 		}
 
 		response := s.executeRequest(request)
@@ -251,6 +272,27 @@ func (s *Server) websocketHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+}
+
+func (s *Server) decodeClientRequest(message []byte) (ClientRequest, error) {
+	var request ClientRequest
+	if err := json.Unmarshal(message, &request); err == nil && request.Action != "" {
+		return request, nil
+	}
+
+	var encrypted EncryptedMessage
+	if err := json.Unmarshal(message, &encrypted); err != nil || encrypted.Ciphertext == "" {
+		return ClientRequest{}, errors.New("invalid message format")
+	}
+
+	plaintext, err := s.decryptEnvelope(encrypted)
+	if err != nil {
+		return ClientRequest{}, fmt.Errorf("decryption failed: %w", err)
+	}
+	if err := json.Unmarshal(plaintext, &request); err != nil || request.Action == "" {
+		return ClientRequest{}, errors.New("request JSON invalid")
+	}
+	return request, nil
 }
 
 func (s *Server) keepWebSocketAlive(conn *websocket.Conn, remoteAddr string, done <-chan struct{}) {

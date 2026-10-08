@@ -33,6 +33,9 @@ let sortState = {
 let openEditorPath = '';
 let socketReady = false;
 let connectionAttempt = 0;
+let transportMode = 'none';
+let authToken = '';
+let httpRequestRunning = false;
 
 connectBtn.addEventListener('click', connectSocket);
 upBtn.addEventListener('click', goUp);
@@ -116,6 +119,8 @@ async function connectSocket() {
   const previousSocket = ws;
   ws = null;
   socketReady = false;
+  transportMode = 'connecting';
+  authToken = token;
   connectBtn.disabled = true;
   statusEl.textContent = 'Connecting...';
   setControlsEnabled(false);
@@ -145,6 +150,7 @@ async function connectSocket() {
       return;
     }
     connectBtn.disabled = false;
+    transportMode = 'none';
     statusEl.textContent = 'Connection failed';
     showOutput('Unable to load startup data: ' + error);
     return;
@@ -155,18 +161,22 @@ async function connectSocket() {
   }
   serverPublicKey = publicKey;
 
-  const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
-  const url = `${protocol}://${window.location.host}/ws?token=${encodeURIComponent(token)}`;
+  if (window.location.protocol !== 'https:') {
+    await activateHTTPTransport(attempt);
+    return;
+  }
+
+  const url = `wss://${window.location.host}/ws?token=${encodeURIComponent(token)}`;
   let socket;
   try {
     socket = new WebSocket(url);
   } catch (error) {
-    connectBtn.disabled = false;
-    statusEl.textContent = 'Connection failed';
-    showOutput(`Unable to create WebSocket: ${error.message || error}`);
+    showOutput(`WebSocket unavailable; trying HTTP transport: ${error.message || error}`);
+    await activateHTTPTransport(attempt);
     return;
   }
   let authenticated = false;
+  let allowHTTPFallback = true;
   const connectionTimeout = window.setTimeout(() => {
     if (socket !== ws || authenticated) {
       return;
@@ -199,7 +209,9 @@ async function connectSocket() {
     if (!authenticated) {
       if (!data.success) {
         window.clearTimeout(connectionTimeout);
+        allowHTTPFallback = false;
         connectBtn.disabled = false;
+        transportMode = 'none';
         statusEl.textContent = 'Authentication failed';
         showOutput(data.message || 'Authentication failed.');
         socket.close(1008, 'Authentication failed');
@@ -209,6 +221,7 @@ async function connectSocket() {
       window.clearTimeout(connectionTimeout);
       authenticated = true;
       socketReady = true;
+      transportMode = 'websocket';
       connectBtn.disabled = false;
       const encrypted = Boolean(window.isSecureContext && window.crypto?.subtle);
       statusEl.textContent = encrypted ? 'Connected' : 'Connected (insecure HTTP)';
@@ -247,15 +260,18 @@ async function connectSocket() {
     );
     ws = null;
     socketReady = false;
-    connectBtn.disabled = false;
-    statusEl.textContent = 'Disconnected';
     setControlsEnabled(false);
     renderEmpty('Connect to load workspace.');
-    showOutput(
-      event.code === 1000
-        ? 'WebSocket closed.'
-        : `WebSocket closed unexpectedly (code ${event.code}).`,
-    );
+    if (allowHTTPFallback && attempt === connectionAttempt) {
+      showOutput(`WebSocket closed (code ${event.code}); switching to HTTP transport...`);
+      activateHTTPTransport(attempt);
+      return;
+    }
+
+    transportMode = 'none';
+    connectBtn.disabled = false;
+    statusEl.textContent = 'Disconnected';
+    showOutput(event.code === 1000 ? 'WebSocket closed.' : `WebSocket closed unexpectedly (code ${event.code}).`);
   });
 
   socket.addEventListener('error', () => {
@@ -263,15 +279,53 @@ async function connectSocket() {
       return;
     }
     socketReady = false;
-    connectBtn.disabled = false;
-    statusEl.textContent = 'Error';
+    statusEl.textContent = 'WebSocket unavailable';
     setControlsEnabled(false);
-    showOutput('WebSocket error.');
+    showOutput('WebSocket error; waiting to switch to HTTP transport...');
   });
 }
 
+async function activateHTTPTransport(attempt) {
+  if (attempt !== connectionAttempt) {
+    return;
+  }
+
+  transportMode = 'http';
+  statusEl.textContent = 'Connecting with HTTP...';
+  connectBtn.disabled = true;
+  setControlsEnabled(false);
+
+  const targetPath = normalizePath(currentPath || rootDir);
+  const response = await sendHTTPCommand({ action: 'list', path: targetPath });
+  if (attempt !== connectionAttempt || transportMode !== 'http') {
+    return;
+  }
+
+  connectBtn.disabled = false;
+  if (!response.success) {
+    transportMode = 'none';
+    statusEl.textContent = response.status === 401 ? 'Authentication failed' : 'Connection failed';
+    renderEmpty('Connect to load workspace.');
+    showOutput(response.message || 'HTTP transport failed.');
+    return;
+  }
+
+  currentPath = targetPath;
+  currentEntries = response.entries || [];
+  const secureHTTP = window.location.protocol === 'https:';
+  statusEl.textContent = secureHTTP ? 'Connected (HTTP)' : 'Connected (insecure HTTP)';
+  setControlsEnabled(true);
+  renderBreadcrumb();
+  renderEntries(currentEntries);
+  showOutput(
+    secureHTTP
+      ? 'Connected using HTTP transport.'
+      : 'Connected using insecure HTTP. Use HTTPS before sending sensitive commands or credentials.',
+  );
+}
+
 async function loadDirectory(path, options = {}) {
-	if (!isSocketOpen()) {
+	if (!isTransportReady()) {
 		return false;
 	}
 
@@ -295,7 +349,7 @@ async function loadDirectory(path, options = {}) {
 }
 
 async function createFolder(parentPath) {
-  if (!isSocketOpen()) {
+  if (!isTransportReady()) {
     showOutput('Socket is not open. Connect first.');
     return;
   }
@@ -395,7 +449,7 @@ function runMenuAction(action) {
 
 function renderBreadcrumb() {
 	currentPathText.textContent = displayCurrentPath();
-	upBtn.disabled = !isSocketOpen() || parentPath(currentPath) === currentPath;
+	upBtn.disabled = !isTransportReady() || parentPath(currentPath) === currentPath;
 }
 
 function renderEntries(entries) {
@@ -703,10 +757,14 @@ function splitCommand(command) {
 }
 
 async function sendEncryptedCommand(payload) {
+  if (transportMode === 'http') {
+    return sendHTTPCommand(payload);
+  }
+
   const socket = ws;
   const publicKey = serverPublicKey;
-  if (!isSocketOpen(socket)) {
-    return { success: false, message: 'Socket is not open. Connect first.' };
+  if (!isWebSocketOpen(socket)) {
+    return { success: false, message: 'Connection is not ready. Connect first.' };
   }
   if (pendingResponse) {
     return { success: false, message: 'A command is already running.' };
@@ -718,7 +776,7 @@ async function sendEncryptedCommand(payload) {
         ? await encryptPayload(payload, publicKey)
         : payload;
 
-    if (!isSocketOpen(socket)) {
+    if (!isWebSocketOpen(socket)) {
       return { success: false, message: 'Connection changed before the command could be sent.' };
     }
 
@@ -754,6 +812,60 @@ async function sendEncryptedCommand(payload) {
       success: false,
       message: `Unable to encrypt or send command: ${error.message || error}`,
     };
+  }
+}
+
+async function sendHTTPCommand(payload) {
+  if (transportMode !== 'http' || !authToken) {
+    return { success: false, message: 'HTTP transport is not ready.' };
+  }
+  if (httpRequestRunning) {
+    return { success: false, message: 'A command is already running.' };
+  }
+
+  httpRequestRunning = true;
+  try {
+    const message =
+      window.isSecureContext && window.crypto?.subtle
+        ? await encryptPayload(payload, serverPublicKey)
+        : payload;
+    const response = await fetch('/api/command', {
+      method: 'POST',
+      cache: 'no-store',
+      headers: {
+        Authorization: `Bearer ${authToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(message),
+    });
+
+    let data;
+    try {
+      data = await response.json();
+    } catch (error) {
+      return {
+        success: false,
+        status: response.status,
+        message: `HTTP transport returned an invalid response (${response.status}).`,
+      };
+    }
+
+    if (!response.ok) {
+      return {
+        ...data,
+        success: false,
+        status: response.status,
+        message: data.message || `HTTP request failed (${response.status}).`,
+      };
+    }
+    return data;
+  } catch (error) {
+    return {
+      success: false,
+      message: `HTTP transport failed: ${error.message || error}`,
+    };
+  } finally {
+    httpRequestRunning = false;
   }
 }
 
@@ -880,8 +992,12 @@ function resolvePending(response, socket) {
   return true;
 }
 
-function isSocketOpen(socket = ws) {
+function isWebSocketOpen(socket = ws) {
   return socket === ws && socketReady && socket?.readyState === WebSocket.OPEN;
+}
+
+function isTransportReady() {
+  return transportMode === 'http' ? Boolean(authToken) : isWebSocketOpen();
 }
 
 function setControlsEnabled(enabled) {
