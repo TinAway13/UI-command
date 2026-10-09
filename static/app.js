@@ -198,10 +198,12 @@ async function connectSocket(event) {
     return;
   }
 
-  const url = `wss://${window.location.host}/ws?token=${encodeURIComponent(token)}`;
+  const url = new URL('ws', document.baseURI);
+  url.protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  url.searchParams.set('token', token);
   let socket;
   try {
-    socket = new WebSocket(url);
+    socket = new WebSocket(url.toString());
   } catch (error) {
     showOutput(`WebSocket unavailable; trying HTTP transport: ${error.message || error}`);
     await activateHTTPTransport(attempt);
@@ -467,7 +469,7 @@ async function downloadEntry(entry) {
   showOutput(entry.isDir ? `Creating ${entry.name}.zip with 7z...` : `Downloading ${entry.name}...`);
 
   try {
-    const response = await fetch(`/api/download?path=${encodeURIComponent(path)}`, {
+    const response = await fetch(`api/download?path=${encodeURIComponent(path)}`, {
       method: 'GET',
       cache: 'no-store',
       headers: { Authorization: `Bearer ${authToken}` },
@@ -512,7 +514,7 @@ async function uploadSelectedFiles() {
     for (const [index, file] of files.entries()) {
       showOutput(`Uploading ${index + 1}/${files.length}: ${file.name}`);
       const targetPath = joinPath(destination, file.name);
-      const response = await fetch(`/api/upload?path=${encodeURIComponent(targetPath)}`, {
+      const response = await fetch(`api/upload?path=${encodeURIComponent(targetPath)}`, {
         method: 'POST',
         cache: 'no-store',
         headers: {
@@ -765,7 +767,7 @@ function entryFromRow(row) {
 }
 
 async function login(username, password) {
-  const response = await fetch('/api/login', {
+  const response = await fetch('api/login', {
     method: 'POST',
     cache: 'no-store',
     headers: { 'Content-Type': 'application/json' },
@@ -784,7 +786,7 @@ async function login(username, password) {
 }
 
 async function fetchPublicKey() {
-  const response = await fetch('/publicKey', { cache: 'no-store' });
+  const response = await fetch('publicKey', { cache: 'no-store' });
   if (!response.ok) {
     throw new Error(response.statusText);
   }
@@ -793,7 +795,7 @@ async function fetchPublicKey() {
 }
 
 async function fetchSystemInfo() {
-  const response = await fetch('/systemInfo', { cache: 'no-store' });
+  const response = await fetch('systemInfo', { cache: 'no-store' });
   if (!response.ok) {
     throw new Error(response.statusText);
   }
@@ -980,7 +982,7 @@ async function sendHTTPCommand(payload) {
       window.isSecureContext && window.crypto?.subtle
         ? await encryptPayload(payload, serverPublicKey)
         : payload;
-    const response = await fetch('/api/command', {
+    const response = await fetch('api/command', {
       method: 'POST',
       cache: 'no-store',
       headers: {

@@ -17,9 +17,15 @@ import (
 )
 
 type generatedConfig struct {
-	JWTSecret  string          `json:"jwt_secret"`
-	Users      []generatedUser `json:"users"`
-	AccessKeys []string        `json:"access_keys"`
+	JWTSecret   string               `json:"jwt_secret"`
+	Users       []generatedUser      `json:"users"`
+	AccessKeys  []string             `json:"access_keys"`
+	ProxyServer generatedProxyServer `json:"proxy_server"`
+}
+
+type generatedProxyServer struct {
+	Enabled bool   `json:"enabled"`
+	Path    string `json:"path"`
 }
 
 type generatedUser struct {
@@ -36,6 +42,7 @@ func main() {
 	outputPath := flag.String("output", "ui-command-config.json", "configuration file to create")
 	userList := flag.String("users", "TinAway13", "comma-separated usernames")
 	keyCount := flag.Int("keys", 1, "number of access keys to generate")
+	proxyPath := flag.String("proxy-path", "", "public reverse-proxy path, for example /portal")
 	flag.Parse()
 
 	if *keyCount < 1 {
@@ -46,7 +53,17 @@ func main() {
 		log.Fatal("at least one username is required")
 	}
 
-	config := generatedConfig{JWTSecret: randomSecret(48)}
+	normalizedProxyPath := strings.TrimRight(strings.TrimSpace(*proxyPath), "/")
+	if normalizedProxyPath != "" && !strings.HasPrefix(normalizedProxyPath, "/") {
+		log.Fatal("proxy-path must start with /")
+	}
+	config := generatedConfig{
+		JWTSecret: randomSecret(48),
+		ProxyServer: generatedProxyServer{
+			Enabled: normalizedProxyPath != "",
+			Path:    normalizedProxyPath,
+		},
+	}
 	passwords := make([]displayedPassword, 0, len(usernames))
 	for _, username := range usernames {
 		password := randomSecret(24)
@@ -83,8 +100,9 @@ func main() {
 		fmt.Printf("  %s: %s\n", account.Username, account.Password)
 	}
 	fmt.Println("Access URLs:")
+	browserPath := normalizedProxyPath
 	for _, accessKey := range config.AccessKeys {
-		fmt.Printf("  http://localhost:8082/?key=%s\n", accessKey)
+		fmt.Printf("  http://localhost:8082%s/?key=%s\n", browserPath, accessKey)
 	}
 }
 

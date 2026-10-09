@@ -47,19 +47,27 @@ var upgrader = websocket.Upgrader{
 }
 
 type Server struct {
-	privateKey     *rsa.PrivateKey
-	publicKey      []byte
-	jwtSecret      string
-	rootDir        string
-	users          []UserCredential
-	accessKeys     []string
-	commandRuntime CommandRuntime
+	privateKey      *rsa.PrivateKey
+	publicKey       []byte
+	jwtSecret       string
+	rootDir         string
+	users           []UserCredential
+	accessKeys      []string
+	commandRuntime  CommandRuntime
+	browserBaseHref string
+	proxyPath       string
 }
 
 type ConfigFile struct {
-	JWTSecret  string       `json:"jwt_secret"`
-	Users      []ConfigUser `json:"users"`
-	AccessKeys []string     `json:"access_keys"`
+	JWTSecret   string            `json:"jwt_secret"`
+	Users       []ConfigUser      `json:"users"`
+	AccessKeys  []string          `json:"access_keys"`
+	ProxyServer ProxyServerConfig `json:"proxy_server"`
+}
+
+type ProxyServerConfig struct {
+	Enabled bool   `json:"enabled"`
+	Path    string `json:"path"`
 }
 
 type ConfigUser struct {
@@ -73,9 +81,11 @@ type UserCredential struct {
 }
 
 type RuntimeConfig struct {
-	JWTSecret  string
-	Users      []UserCredential
-	AccessKeys []string
+	JWTSecret       string
+	Users           []UserCredential
+	AccessKeys      []string
+	BrowserBaseHref string
+	ProxyPath       string
 }
 
 type CommandRuntimeFile struct {
@@ -177,33 +187,51 @@ func main() {
 	}
 
 	s := &Server{
-		privateKey:     privateKey,
-		publicKey:      publicKeyPEM,
-		jwtSecret:      config.JWTSecret,
-		rootDir:        absRoot,
-		users:          config.Users,
-		accessKeys:     config.AccessKeys,
-		commandRuntime: commandRuntime,
+		privateKey:      privateKey,
+		publicKey:       publicKeyPEM,
+		jwtSecret:       config.JWTSecret,
+		rootDir:         absRoot,
+		users:           config.Users,
+		accessKeys:      config.AccessKeys,
+		commandRuntime:  commandRuntime,
+		browserBaseHref: config.BrowserBaseHref,
+		proxyPath:       config.ProxyPath,
 	}
 
-	http.HandleFunc("/", s.indexHandler)
-	http.HandleFunc("/api/login", s.loginHandler)
-	http.HandleFunc("/publicKey", s.publicKeyHandler)
-	http.HandleFunc("/systemInfo", s.systemInfoHandler)
-	http.HandleFunc("/api/command", s.commandHandler)
-	http.HandleFunc("/api/download", s.downloadHandler)
-	http.HandleFunc("/api/upload", s.uploadHandler)
-	http.HandleFunc("/ws", s.websocketHandler)
-	staticFiles := http.StripPrefix("/static/", http.FileServer(http.Dir("static")))
-	http.Handle("/static/", noCache(s.requirePageAccess(staticFiles)))
+	mux := http.NewServeMux()
+	s.registerRoutes(mux, "")
+	if s.proxyPath != "" {
+		s.registerRoutes(mux, s.proxyPath)
+		mux.HandleFunc(s.proxyPath, func(w http.ResponseWriter, r *http.Request) {
+			target := s.proxyPath + "/"
+			if r.URL.RawQuery != "" {
+				target += "?" + r.URL.RawQuery
+			}
+			http.Redirect(w, r, target, http.StatusPermanentRedirect)
+		})
+	}
 
 	log.Printf("starting server on http://localhost:8082")
 	log.Printf("start path: %s", absRoot)
-	log.Fatal(http.ListenAndServe(":8082", nil))
+	log.Fatal(http.ListenAndServe(":8082", mux))
+}
+
+func (s *Server) registerRoutes(mux *http.ServeMux, prefix string) {
+	mux.HandleFunc(prefix+"/", s.indexHandler)
+	mux.HandleFunc(prefix+"/api/login", s.loginHandler)
+	mux.HandleFunc(prefix+"/publicKey", s.publicKeyHandler)
+	mux.HandleFunc(prefix+"/systemInfo", s.systemInfoHandler)
+	mux.HandleFunc(prefix+"/api/command", s.commandHandler)
+	mux.HandleFunc(prefix+"/api/download", s.downloadHandler)
+	mux.HandleFunc(prefix+"/api/upload", s.uploadHandler)
+	mux.HandleFunc(prefix+"/ws", s.websocketHandler)
+	staticPrefix := prefix + "/static/"
+	staticFiles := http.StripPrefix(staticPrefix, http.FileServer(http.Dir("static")))
+	mux.Handle(staticPrefix, noCache(s.requirePageAccess(staticFiles)))
 }
 
 func (s *Server) indexHandler(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/" {
+	if r.URL.Path != "/" && r.URL.Path != s.proxyPath+"/" {
 		http.NotFound(w, r)
 		return
 	}
@@ -212,7 +240,18 @@ func (s *Server) indexHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Cache-Control", "no-store")
-	http.ServeFile(w, r, "static/index.html")
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	content, err := os.ReadFile("static/index.html")
+	if err != nil {
+		http.Error(w, "unable to load application page", http.StatusInternalServerError)
+		return
+	}
+	baseHref := s.browserBaseHref
+	if baseHref == "" {
+		baseHref = "/"
+	}
+	content = []byte(strings.Replace(string(content), "{{APP_BASE_HREF}}", baseHref, 1))
+	w.Write(content)
 }
 
 func (s *Server) requirePageAccess(next http.Handler) http.Handler {
@@ -308,7 +347,42 @@ func loadConfig(path string) (RuntimeConfig, error) {
 		}
 		runtimeConfig.AccessKeys = append(runtimeConfig.AccessKeys, accessKey)
 	}
+	baseHref, proxyPath, err := proxyBaseSettings(fileConfig.ProxyServer)
+	if err != nil {
+		return RuntimeConfig{}, err
+	}
+	runtimeConfig.BrowserBaseHref = baseHref
+	runtimeConfig.ProxyPath = proxyPath
 	return runtimeConfig, nil
+}
+
+func proxyBaseHref(config ProxyServerConfig) (string, error) {
+	baseHref, _, err := proxyBaseSettings(config)
+	return baseHref, err
+}
+
+func proxyBaseSettings(config ProxyServerConfig) (string, string, error) {
+	if !config.Enabled {
+		return "/", "", nil
+	}
+	proxyPath := strings.TrimSpace(config.Path)
+	if proxyPath == "" {
+		return "", "", errors.New("proxy_server.path is required when proxy_server.enabled is true")
+	}
+	if !strings.HasPrefix(proxyPath, "/") {
+		return "", "", errors.New("proxy_server.path must start with /")
+	}
+	if strings.ContainsAny(proxyPath, `?#\`) {
+		return "", "", errors.New("proxy_server.path cannot contain ?, #, or \\")
+	}
+	segments := strings.Split(strings.Trim(proxyPath, "/"), "/")
+	for _, segment := range segments {
+		if segment == "" || segment == "." || segment == ".." {
+			return "", "", errors.New("proxy_server.path contains an invalid segment")
+		}
+	}
+	cleanPath := "/" + strings.Join(segments, "/")
+	return cleanPath + "/", cleanPath, nil
 }
 
 func loadCommandRuntime(path string) (CommandRuntime, error) {

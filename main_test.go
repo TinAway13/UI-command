@@ -113,6 +113,78 @@ func TestLoadConfigArrays(t *testing.T) {
 	if len(config.AccessKeys) != 2 || config.AccessKeys[1] != "key_two" {
 		t.Fatalf("access keys = %#v, want two configured keys", config.AccessKeys)
 	}
+	if config.BrowserBaseHref != "/" {
+		t.Fatalf("browser base href = %q, want /", config.BrowserBaseHref)
+	}
+	if config.ProxyPath != "" {
+		t.Fatalf("proxy path = %q, want empty", config.ProxyPath)
+	}
+}
+
+func TestProxyBaseHref(t *testing.T) {
+	tests := []struct {
+		name    string
+		config  ProxyServerConfig
+		want    string
+		wantErr bool
+	}{
+		{name: "disabled", config: ProxyServerConfig{}, want: "/"},
+		{name: "enabled", config: ProxyServerConfig{Enabled: true, Path: "/portal/"}, want: "/portal/"},
+		{name: "nested", config: ProxyServerConfig{Enabled: true, Path: "/tools/command"}, want: "/tools/command/"},
+		{name: "missing path", config: ProxyServerConfig{Enabled: true}, wantErr: true},
+		{name: "relative path", config: ProxyServerConfig{Enabled: true, Path: "portal"}, wantErr: true},
+		{name: "parent segment", config: ProxyServerConfig{Enabled: true, Path: "/tools/../portal"}, wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := proxyBaseHref(test.config)
+			if test.wantErr {
+				if err == nil {
+					t.Fatalf("proxyBaseHref() = %q, want error", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("proxyBaseHref() error: %v", err)
+			}
+			if got != test.want {
+				t.Fatalf("proxyBaseHref() = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestProxyRoutes(t *testing.T) {
+	server := &Server{
+		accessKeys:      []string{"key_proxy-test"},
+		browserBaseHref: "/portal/",
+		proxyPath:       "/portal",
+	}
+	mux := http.NewServeMux()
+	server.registerRoutes(mux, "")
+	server.registerRoutes(mux, server.proxyPath)
+
+	pageRequest := httptest.NewRequest(http.MethodGet, "/portal/?key=key_proxy-test", nil)
+	pageResponse := httptest.NewRecorder()
+	mux.ServeHTTP(pageResponse, pageRequest)
+	if pageResponse.Code != http.StatusOK {
+		t.Fatalf("page status = %d, want %d", pageResponse.Code, http.StatusOK)
+	}
+	if !strings.Contains(pageResponse.Body.String(), `<base href="/portal/"`) {
+		t.Fatalf("page does not contain configured proxy base href")
+	}
+	cookies := pageResponse.Result().Cookies()
+	if len(cookies) == 0 {
+		t.Fatal("proxy page did not set access cookie")
+	}
+
+	staticRequest := httptest.NewRequest(http.MethodGet, "/portal/static/styles.css", nil)
+	staticRequest.AddCookie(cookies[0])
+	staticResponse := httptest.NewRecorder()
+	mux.ServeHTTP(staticResponse, staticRequest)
+	if staticResponse.Code != http.StatusOK {
+		t.Fatalf("static status = %d, want %d", staticResponse.Code, http.StatusOK)
+	}
 }
 
 func TestLoadCommandRuntime(t *testing.T) {
