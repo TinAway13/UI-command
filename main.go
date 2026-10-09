@@ -6,8 +6,10 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -27,8 +29,10 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-const defaultJWTSecret = "change_this_secret_to_a_strong_value"
 const defaultRootDir = "."
+const defaultConfigPath = "ui-command-config.json"
+const accessCookieName = "ui_command_access"
+const accessCookieTTL = 8 * time.Hour
 const maxReadFileBytes = 2 * 1024 * 1024
 const maxWebSocketMessageBytes = 4 * 1024 * 1024
 const maxUploadBytes = 1024 * 1024 * 1024
@@ -45,6 +49,30 @@ type Server struct {
 	publicKey  []byte
 	jwtSecret  string
 	rootDir    string
+	users      []UserCredential
+	accessKeys []string
+}
+
+type ConfigFile struct {
+	JWTSecret  string       `json:"jwt_secret"`
+	Users      []ConfigUser `json:"users"`
+	AccessKeys []string     `json:"access_keys"`
+}
+
+type ConfigUser struct {
+	Username       string `json:"username"`
+	PasswordSHA256 string `json:"password_sha256"`
+}
+
+type UserCredential struct {
+	Username     string
+	PasswordHash [sha256.Size]byte
+}
+
+type RuntimeConfig struct {
+	JWTSecret  string
+	Users      []UserCredential
+	AccessKeys []string
 }
 
 type EncryptedMessage struct {
@@ -90,11 +118,25 @@ type FileContentResponse struct {
 	Content string `json:"content"`
 }
 
+type LoginRequest struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+type LoginResponse struct {
+	Success bool   `json:"success"`
+	Token   string `json:"token,omitempty"`
+	Message string `json:"message,omitempty"`
+}
+
 func main() {
-	jwtSecret := os.Getenv("JWT_SECRET")
-	if jwtSecret == "" {
-		jwtSecret = defaultJWTSecret
-		log.Println("WARNING: using default JWT secret. Set JWT_SECRET to a strong value in production.")
+	configPath := os.Getenv("UI_COMMAND_CONFIG")
+	if configPath == "" {
+		configPath = defaultConfigPath
+	}
+	config, err := loadConfig(configPath)
+	if err != nil {
+		log.Fatalf("unable to load config %q: %v; run go run script_create_password.go", configPath, err)
 	}
 
 	rootDir := os.Getenv("APP_ROOT")
@@ -112,19 +154,17 @@ func main() {
 		log.Fatalf("unable to generate server RSA key pair: %v", err)
 	}
 
-	startupToken, err := generateJWT(jwtSecret, jwtTokenTTL)
-	if err != nil {
-		log.Fatalf("unable to generate startup JWT token: %v", err)
-	}
-
 	s := &Server{
 		privateKey: privateKey,
 		publicKey:  publicKeyPEM,
-		jwtSecret:  jwtSecret,
+		jwtSecret:  config.JWTSecret,
 		rootDir:    absRoot,
+		users:      config.Users,
+		accessKeys: config.AccessKeys,
 	}
 
 	http.HandleFunc("/", s.indexHandler)
+	http.HandleFunc("/api/login", s.loginHandler)
 	http.HandleFunc("/publicKey", s.publicKeyHandler)
 	http.HandleFunc("/systemInfo", s.systemInfoHandler)
 	http.HandleFunc("/api/command", s.commandHandler)
@@ -132,27 +172,11 @@ func main() {
 	http.HandleFunc("/api/upload", s.uploadHandler)
 	http.HandleFunc("/ws", s.websocketHandler)
 	staticFiles := http.StripPrefix("/static/", http.FileServer(http.Dir("static")))
-	http.Handle("/static/", noCache(staticFiles))
+	http.Handle("/static/", noCache(s.requirePageAccess(staticFiles)))
 
 	log.Printf("starting server on http://localhost:8082")
 	log.Printf("start path: %s", absRoot)
-	log.Printf("JWT token valid for 60 minutes: %s", startupToken)
-	go logJWTRenewals(jwtSecret, jwtTokenTTL)
 	log.Fatal(http.ListenAndServe(":8082", nil))
-}
-
-func logJWTRenewals(secret string, ttl time.Duration) {
-	ticker := time.NewTicker(ttl)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		token, err := generateJWT(secret, ttl)
-		if err != nil {
-			log.Printf("unable to renew JWT token: %v", err)
-			continue
-		}
-		log.Printf("JWT token renewed and valid for 60 minutes: %s", token)
-	}
 }
 
 func (s *Server) indexHandler(w http.ResponseWriter, r *http.Request) {
@@ -160,8 +184,153 @@ func (s *Server) indexHandler(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	if !s.hasPageAccess(w, r) {
+		http.NotFound(w, r)
+		return
+	}
 	w.Header().Set("Cache-Control", "no-store")
 	http.ServeFile(w, r, "static/index.html")
+}
+
+func (s *Server) requirePageAccess(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !s.hasPageAccess(w, r) {
+			http.NotFound(w, r)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (s *Server) hasPageAccess(w http.ResponseWriter, r *http.Request) bool {
+	providedKey := r.URL.Query().Get("key")
+	if providedKey != "" && s.isValidAccessKey(providedKey) {
+		http.SetCookie(w, &http.Cookie{
+			Name: accessCookieName, Value: providedKey, Path: "/",
+			MaxAge: int(accessCookieTTL.Seconds()), HttpOnly: true,
+			Secure: r.TLS != nil, SameSite: http.SameSiteStrictMode,
+		})
+		return true
+	}
+	cookie, err := r.Cookie(accessCookieName)
+	return err == nil && s.isValidAccessKey(cookie.Value)
+}
+
+func (s *Server) isValidAccessKey(provided string) bool {
+	valid := false
+	for _, accessKey := range s.accessKeys {
+		valid = secureStringEqual(provided, accessKey) || valid
+	}
+	return valid
+}
+
+func secureStringEqual(left, right string) bool {
+	leftHash := sha256.Sum256([]byte(left))
+	rightHash := sha256.Sum256([]byte(right))
+	return subtle.ConstantTimeCompare(leftHash[:], rightHash[:]) == 1
+}
+
+func parsePasswordHash(value string) ([sha256.Size]byte, error) {
+	var result [sha256.Size]byte
+	if value == "" {
+		return result, errors.New("value is required")
+	}
+	decoded, err := hex.DecodeString(value)
+	if err != nil || len(decoded) != sha256.Size {
+		return result, errors.New("must be a 64-character SHA-256 hex value")
+	}
+	copy(result[:], decoded)
+	return result, nil
+}
+
+func loadConfig(path string) (RuntimeConfig, error) {
+	var runtimeConfig RuntimeConfig
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return runtimeConfig, err
+	}
+	var fileConfig ConfigFile
+	if err := json.Unmarshal(content, &fileConfig); err != nil {
+		return runtimeConfig, fmt.Errorf("invalid JSON: %w", err)
+	}
+	fileConfig.JWTSecret = strings.TrimSpace(fileConfig.JWTSecret)
+	if fileConfig.JWTSecret == "" {
+		return runtimeConfig, errors.New("jwt_secret is required")
+	}
+	if len(fileConfig.Users) == 0 {
+		return runtimeConfig, errors.New("at least one user is required")
+	}
+	if len(fileConfig.AccessKeys) == 0 {
+		return runtimeConfig, errors.New("at least one access key is required")
+	}
+
+	runtimeConfig.JWTSecret = fileConfig.JWTSecret
+	for index, user := range fileConfig.Users {
+		user.Username = strings.TrimSpace(user.Username)
+		if user.Username == "" {
+			return RuntimeConfig{}, fmt.Errorf("users[%d].username is required", index)
+		}
+		passwordHash, err := parsePasswordHash(user.PasswordSHA256)
+		if err != nil {
+			return RuntimeConfig{}, fmt.Errorf("users[%d].password_sha256: %w", index, err)
+		}
+		runtimeConfig.Users = append(runtimeConfig.Users, UserCredential{
+			Username: user.Username, PasswordHash: passwordHash,
+		})
+	}
+	for index, accessKey := range fileConfig.AccessKeys {
+		accessKey = strings.TrimSpace(accessKey)
+		if accessKey == "" {
+			return RuntimeConfig{}, fmt.Errorf("access_keys[%d] cannot be empty", index)
+		}
+		runtimeConfig.AccessKeys = append(runtimeConfig.AccessKeys, accessKey)
+	}
+	return runtimeConfig, nil
+}
+
+func (s *Server) loginHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		json.NewEncoder(w).Encode(LoginResponse{Success: false, Message: "POST required"})
+		return
+	}
+	if !s.hasPageAccess(w, r) {
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(LoginResponse{Success: false, Message: "not found"})
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, 8*1024)
+	var request LoginRequest
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(LoginResponse{Success: false, Message: "invalid login request"})
+		return
+	}
+	providedHash := sha256.Sum256([]byte(request.Password))
+	validCredentials := false
+	for _, user := range s.users {
+		usernameMatches := secureStringEqual(request.Username, user.Username)
+		passwordMatches := subtle.ConstantTimeCompare(providedHash[:], user.PasswordHash[:]) == 1
+		validCredentials = (usernameMatches && passwordMatches) || validCredentials
+	}
+	if !validCredentials {
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(LoginResponse{Success: false, Message: "invalid username or password"})
+		return
+	}
+
+	token, err := generateJWT(s.jwtSecret, jwtTokenTTL)
+	if err != nil {
+		log.Printf("JWT generation failed: %v", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(LoginResponse{Success: false, Message: "login failed"})
+		return
+	}
+	json.NewEncoder(w).Encode(LoginResponse{Success: true, Token: token})
 }
 
 func noCache(next http.Handler) http.Handler {
@@ -172,6 +341,10 @@ func noCache(next http.Handler) http.Handler {
 }
 
 func (s *Server) publicKeyHandler(w http.ResponseWriter, r *http.Request) {
+	if !s.hasPageAccess(w, r) {
+		http.NotFound(w, r)
+		return
+	}
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(PublicKeyResponse{PublicKey: string(s.publicKey)}); err != nil {
@@ -180,6 +353,10 @@ func (s *Server) publicKeyHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) systemInfoHandler(w http.ResponseWriter, r *http.Request) {
+	if !s.hasPageAccess(w, r) {
+		http.NotFound(w, r)
+		return
+	}
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(SystemInfoResponse{
@@ -755,7 +932,7 @@ func (s *Server) validateToken(tokenString string) error {
 		return errors.New("token missing")
 	}
 	_, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
-		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+		if token.Method != jwt.SigningMethodHS256 {
 			return nil, fmt.Errorf("unexpected JWT signing method: %v", token.Header["alg"])
 		}
 		return []byte(s.jwtSecret), nil

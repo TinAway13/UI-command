@@ -1,7 +1,9 @@
 const connectBtn = document.getElementById('connectBtn');
 const statusEl = document.getElementById('status');
 const outputEl = document.getElementById('output');
-const tokenInput = document.getElementById('token');
+const loginForm = document.getElementById('loginForm');
+const usernameInput = document.getElementById('gcp_ui_username');
+const passwordInput = document.getElementById('gcp_ui_password');
 const fileListEl = document.getElementById('fileList');
 const currentPathText = document.getElementById('currentPathText');
 const commandForm = document.getElementById('commandForm');
@@ -41,7 +43,7 @@ let authToken = '';
 let httpRequestRunning = false;
 let fileTransferRunning = false;
 
-connectBtn.addEventListener('click', connectSocket);
+loginForm.addEventListener('submit', connectSocket);
 upBtn.addEventListener('click', goUp);
 refreshBtn.addEventListener('click', () => loadDirectory(currentPath));
 downloadBtn.addEventListener('click', () => downloadEntry(selectedEntry));
@@ -115,10 +117,12 @@ document.addEventListener('keydown', (event) => {
   }
 });
 
-async function connectSocket() {
-  const token = tokenInput.value.trim();
-  if (!token) {
-    showOutput('Enter a JWT token before connecting.');
+async function connectSocket(event) {
+  event?.preventDefault();
+  const username = usernameInput.value.trim();
+  const password = passwordInput.value;
+  if (!username || !password) {
+    showOutput('Enter your username and password before connecting.');
     return;
   }
 
@@ -127,9 +131,9 @@ async function connectSocket() {
   ws = null;
   socketReady = false;
   transportMode = 'connecting';
-  authToken = token;
+  authToken = '';
   connectBtn.disabled = true;
-  statusEl.textContent = 'Connecting...';
+  statusEl.textContent = 'Signing in...';
   setControlsEnabled(false);
 
   if (previousSocket) {
@@ -148,6 +152,27 @@ async function connectSocket() {
       }
     }
   }
+
+  let token;
+  try {
+    token = await login(username, password);
+  } catch (error) {
+    if (attempt !== connectionAttempt) {
+      return;
+    }
+    connectBtn.disabled = false;
+    transportMode = 'none';
+    statusEl.textContent = 'Authentication failed';
+    showOutput(error.message || String(error));
+    return;
+  }
+
+  if (attempt !== connectionAttempt) {
+    return;
+  }
+  authToken = token;
+  passwordInput.value = '';
+  statusEl.textContent = 'Connecting...';
 
   let publicKey;
   try {
@@ -737,6 +762,25 @@ function entryFromRow(row) {
     size: Number(row.dataset.size || 0),
     modTime: row.dataset.modTime || '',
   };
+}
+
+async function login(username, password) {
+  const response = await fetch('/api/login', {
+    method: 'POST',
+    cache: 'no-store',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, password }),
+  });
+  let data;
+  try {
+    data = await response.json();
+  } catch (error) {
+    throw new Error(`Login returned an invalid response (${response.status}).`);
+  }
+  if (!response.ok || !data.success || !data.token) {
+    throw new Error(data.message || 'Invalid username or password.');
+  }
+  return data.token;
 }
 
 async function fetchPublicKey() {

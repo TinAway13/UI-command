@@ -99,6 +99,21 @@ button:disabled {
   color: #5d687b;
 }
 
+.login-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: end;
+}
+
+.login-form label {
+  margin-bottom: 6px;
+}
+
+.login-form button {
+  min-width: 110px;
+}
+
 .explorer-panel {
   padding: 0;
   overflow: hidden;
@@ -258,6 +273,11 @@ button:disabled {
   background: #f8fafc;
 }
 
+.command-bar-top {
+  border-top: 0;
+  border-bottom: 1px solid #dfe4ee;
+}
+
 .command-bar label {
   margin: 0;
 }
@@ -394,6 +414,10 @@ pre {
 
   .path-bar,
   .command-bar {
+    grid-template-columns: 1fr;
+  }
+
+  .login-form {
     grid-template-columns: 1fr;
   }
 

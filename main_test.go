@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -12,6 +14,105 @@ import (
 	"testing"
 	"time"
 )
+
+func TestPageAccessAndPasswordLogin(t *testing.T) {
+	passwordHash := sha256.Sum256([]byte("correct-password"))
+	server := &Server{
+		jwtSecret: "test-jwt-secret",
+		users: []UserCredential{
+			{Username: "tinaway13", PasswordHash: passwordHash},
+		},
+		accessKeys: []string{"key_test-access", "key_second-access"},
+	}
+
+	t.Run("page requires access key", func(t *testing.T) {
+		request := httptest.NewRequest(http.MethodGet, "/", nil)
+		response := httptest.NewRecorder()
+		server.indexHandler(response, request)
+		if response.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want %d", response.Code, http.StatusNotFound)
+		}
+	})
+
+	pageRequest := httptest.NewRequest(http.MethodGet, "/?key=key_test-access", nil)
+	pageResponse := httptest.NewRecorder()
+	server.indexHandler(pageResponse, pageRequest)
+	if pageResponse.Code != http.StatusOK {
+		t.Fatalf("keyed page status = %d, want %d", pageResponse.Code, http.StatusOK)
+	}
+	cookies := pageResponse.Result().Cookies()
+	if len(cookies) != 1 || cookies[0].Name != accessCookieName {
+		t.Fatalf("access cookie = %#v, want %s", cookies, accessCookieName)
+	}
+
+	t.Run("second configured key is accepted", func(t *testing.T) {
+		request := httptest.NewRequest(http.MethodGet, "/?key=key_second-access", nil)
+		response := httptest.NewRecorder()
+		server.indexHandler(response, request)
+		if response.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d", response.Code, http.StatusOK)
+		}
+	})
+
+	t.Run("correct credentials return JWT", func(t *testing.T) {
+		body := strings.NewReader(`{"username":"tinaway13","password":"correct-password"}`)
+		request := httptest.NewRequest(http.MethodPost, "/api/login", body)
+		request.AddCookie(cookies[0])
+		response := httptest.NewRecorder()
+		server.loginHandler(response, request)
+		if response.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d; body: %s", response.Code, http.StatusOK, response.Body.String())
+		}
+		var login LoginResponse
+		if err := json.NewDecoder(response.Body).Decode(&login); err != nil {
+			t.Fatalf("decode login response: %v", err)
+		}
+		if !login.Success || login.Token == "" {
+			t.Fatalf("login response = %#v, want token", login)
+		}
+		if err := server.validateToken(login.Token); err != nil {
+			t.Fatalf("returned token is invalid: %v", err)
+		}
+	})
+
+	t.Run("incorrect password is rejected", func(t *testing.T) {
+		body := strings.NewReader(`{"username":"tinaway13","password":"wrong"}`)
+		request := httptest.NewRequest(http.MethodPost, "/api/login", body)
+		request.AddCookie(cookies[0])
+		response := httptest.NewRecorder()
+		server.loginHandler(response, request)
+		if response.Code != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want %d", response.Code, http.StatusUnauthorized)
+		}
+	})
+}
+
+func TestLoadConfigArrays(t *testing.T) {
+	passwordHash := sha256.Sum256([]byte("password"))
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	configJSON := fmt.Sprintf(`{
+  "jwt_secret": "jwt-secret",
+  "users": [
+    {"username": "first", "password_sha256": %q},
+    {"username": "second", "password_sha256": %q}
+  ],
+  "access_keys": ["key_one", "key_two"]
+}`, fmt.Sprintf("%x", passwordHash), fmt.Sprintf("%x", passwordHash))
+	if err := os.WriteFile(configPath, []byte(configJSON), 0600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	config, err := loadConfig(configPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if len(config.Users) != 2 || config.Users[1].Username != "second" {
+		t.Fatalf("users = %#v, want two configured users", config.Users)
+	}
+	if len(config.AccessKeys) != 2 || config.AccessKeys[1] != "key_two" {
+		t.Fatalf("access keys = %#v, want two configured keys", config.AccessKeys)
+	}
+}
 
 func TestCommandHandler(t *testing.T) {
 	privateKey, publicKey, err := generateKeyPairPEM(2048)

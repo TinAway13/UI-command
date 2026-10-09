@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>GCP Linux Command UI</title>
-  <link rel="stylesheet" href="/static/styles.css?v=2" />
+  <link rel="stylesheet" href="/static/styles.css?v=3" />
 </head>
 <body>
   <div class="app-shell">
@@ -12,13 +12,26 @@
 
     <section class="panel">
       <h2>Connection</h2>
-      <label>JWT Token</label>
-      <input id="token" type="password" placeholder="Bearer JWT token" />
-      <button id="connectBtn">Connect</button>
+      <form id="loginForm" class="login-form">
+        <div>
+          <label for="gcp_ui_username">Username</label>
+          <input id="gcp_ui_username" name="username" type="text" value="" autocomplete="username" required />
+        </div>
+        <div>
+          <label for="gcp_ui_password">Password</label>
+          <input id="gcp_ui_password" name="password" type="password" autocomplete="current-password" required />
+        </div>
+        <button id="connectBtn" type="submit">Connect</button>
+      </form>
       <p id="status">Not connected</p>
     </section>
 
     <section class="panel explorer-panel">
+      <form id="commandForm" class="command-bar command-bar-top">
+        <label for="commandInput">Command</label>
+        <input id="commandInput" type="text" placeholder="cd folder, cd .., mkdir name, rename old new, delete name, refresh" disabled />
+        <button id="commandBtn" type="submit" disabled>Run</button>
+      </form>
       <div class="explorer-header">
         <h2>Workspace</h2>
         <div class="toolbar">
@@ -36,11 +49,6 @@
       <div id="fileList" class="file-list" tabindex="0" aria-label="Workspace files">
         <div class="empty-state">Connect to load workspace.</div>
       </div>
-      <form id="commandForm" class="command-bar">
-        <label for="commandInput">Command</label>
-        <input id="commandInput" type="text" placeholder="cd folder, cd .., mkdir name, rename old new, delete name, refresh" disabled />
-        <button id="commandBtn" type="submit" disabled>Run</button>
-      </form>
     </section>
 
     <section class="panel">
@@ -75,6 +83,6 @@
     <button type="button" data-menu-action="refresh">Refresh</button>
   </nav>
 
-  <script src="/static/app.js?v=7"></script>
+  <script src="/static/app.js?v=8"></script>
 </body>
 </html>
