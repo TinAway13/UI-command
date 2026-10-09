@@ -32,6 +32,10 @@
         <input id="commandInput" type="text" placeholder="cd folder, cd .., mkdir name, rename old new, delete name, refresh" disabled />
         <button id="commandBtn" type="submit" disabled>Run</button>
       </form>
+      <div class="command-output">
+        <h2>Output</h2>
+        <pre id="output">Ready.</pre>
+      </div>
       <div class="explorer-header">
         <h2>Workspace</h2>
         <div class="toolbar">
@@ -49,11 +53,6 @@
       <div id="fileList" class="file-list" tabindex="0" aria-label="Workspace files">
         <div class="empty-state">Connect to load workspace.</div>
       </div>
-    </section>
-
-    <section class="panel">
-      <h2>Output</h2>
-      <pre id="output">Ready.</pre>
     </section>
 
     <section id="editorPanel" class="panel editor-panel" hidden>

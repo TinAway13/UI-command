@@ -278,6 +278,16 @@ button:disabled {
   border-bottom: 1px solid #dfe4ee;
 }
 
+.command-output {
+  padding: 14px 16px 16px;
+  border-bottom: 1px solid #dfe4ee;
+  background: #ffffff;
+}
+
+.command-output h2 {
+  margin-bottom: 10px;
+}
+
 .command-bar label {
   margin: 0;
 }
