@@ -1,0 +1,20 @@
+{
+  "paths": {
+    "linux": [
+      "/usr/local/go/bin",
+      "/opt/go/bin",
+      "/snap/bin",
+      "/usr/local/bin",
+      "/usr/bin",
+      "/bin"
+    ],
+    "windows": []
+  },
+  "environment": {
+    "linux": {
+      "GOCACHE": "/tmp/ui-command-go-cache"
+    },
+    "windows": {}
+  },
+  "timeout_seconds": 120
+}

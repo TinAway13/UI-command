@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -31,6 +32,7 @@ import (
 
 const defaultRootDir = "."
 const defaultConfigPath = "ui-command-config.json"
+const defaultCommandRuntimeConfigPath = "command-runtime-config.json"
 const accessCookieName = "ui_command_access"
 const accessCookieTTL = 8 * time.Hour
 const maxReadFileBytes = 2 * 1024 * 1024
@@ -45,12 +47,13 @@ var upgrader = websocket.Upgrader{
 }
 
 type Server struct {
-	privateKey *rsa.PrivateKey
-	publicKey  []byte
-	jwtSecret  string
-	rootDir    string
-	users      []UserCredential
-	accessKeys []string
+	privateKey     *rsa.PrivateKey
+	publicKey      []byte
+	jwtSecret      string
+	rootDir        string
+	users          []UserCredential
+	accessKeys     []string
+	commandRuntime CommandRuntime
 }
 
 type ConfigFile struct {
@@ -73,6 +76,17 @@ type RuntimeConfig struct {
 	JWTSecret  string
 	Users      []UserCredential
 	AccessKeys []string
+}
+
+type CommandRuntimeFile struct {
+	Paths          map[string][]string          `json:"paths"`
+	Environment    map[string]map[string]string `json:"environment"`
+	TimeoutSeconds int                          `json:"timeout_seconds"`
+}
+
+type CommandRuntime struct {
+	Environment []string
+	Timeout     time.Duration
 }
 
 type EncryptedMessage struct {
@@ -138,6 +152,14 @@ func main() {
 	if err != nil {
 		log.Fatalf("unable to load config %q: %v; run go run script_create_password.go", configPath, err)
 	}
+	commandConfigPath := os.Getenv("COMMAND_RUNTIME_CONFIG")
+	if commandConfigPath == "" {
+		commandConfigPath = defaultCommandRuntimeConfigPath
+	}
+	commandRuntime, err := loadCommandRuntime(commandConfigPath)
+	if err != nil {
+		log.Fatalf("unable to load command config %q: %v", commandConfigPath, err)
+	}
 
 	rootDir := os.Getenv("APP_ROOT")
 	if rootDir == "" {
@@ -155,12 +177,13 @@ func main() {
 	}
 
 	s := &Server{
-		privateKey: privateKey,
-		publicKey:  publicKeyPEM,
-		jwtSecret:  config.JWTSecret,
-		rootDir:    absRoot,
-		users:      config.Users,
-		accessKeys: config.AccessKeys,
+		privateKey:     privateKey,
+		publicKey:      publicKeyPEM,
+		jwtSecret:      config.JWTSecret,
+		rootDir:        absRoot,
+		users:          config.Users,
+		accessKeys:     config.AccessKeys,
+		commandRuntime: commandRuntime,
 	}
 
 	http.HandleFunc("/", s.indexHandler)
@@ -286,6 +309,61 @@ func loadConfig(path string) (RuntimeConfig, error) {
 		runtimeConfig.AccessKeys = append(runtimeConfig.AccessKeys, accessKey)
 	}
 	return runtimeConfig, nil
+}
+
+func loadCommandRuntime(path string) (CommandRuntime, error) {
+	var runtimeConfig CommandRuntime
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return runtimeConfig, err
+	}
+	var fileConfig CommandRuntimeFile
+	if err := json.Unmarshal(content, &fileConfig); err != nil {
+		return runtimeConfig, fmt.Errorf("invalid JSON: %w", err)
+	}
+	if fileConfig.TimeoutSeconds < 1 || fileConfig.TimeoutSeconds > 3600 {
+		return runtimeConfig, errors.New("timeout_seconds must be between 1 and 3600")
+	}
+
+	runtimeConfig.Timeout = time.Duration(fileConfig.TimeoutSeconds) * time.Second
+	runtimeConfig.Environment = append([]string(nil), os.Environ()...)
+	configuredPaths := make([]string, 0, len(fileConfig.Paths[runtime.GOOS]))
+	for _, pathEntry := range fileConfig.Paths[runtime.GOOS] {
+		pathEntry = strings.TrimSpace(pathEntry)
+		if pathEntry != "" {
+			configuredPaths = append(configuredPaths, pathEntry)
+		}
+	}
+	if len(configuredPaths) > 0 {
+		pathValue := strings.Join(configuredPaths, string(os.PathListSeparator))
+		if inheritedPath := os.Getenv("PATH"); inheritedPath != "" {
+			pathValue += string(os.PathListSeparator) + inheritedPath
+		}
+		runtimeConfig.Environment = setEnvironmentValue(runtimeConfig.Environment, "PATH", pathValue)
+	}
+	for name, value := range fileConfig.Environment[runtime.GOOS] {
+		name = strings.TrimSpace(name)
+		if name == "" || strings.Contains(name, "=") {
+			return CommandRuntime{}, fmt.Errorf("invalid environment variable name %q", name)
+		}
+		runtimeConfig.Environment = setEnvironmentValue(runtimeConfig.Environment, name, value)
+	}
+	return runtimeConfig, nil
+}
+
+func setEnvironmentValue(environment []string, name, value string) []string {
+	prefix := name + "="
+	for index, entry := range environment {
+		matches := strings.HasPrefix(entry, prefix)
+		if runtime.GOOS == "windows" {
+			matches = strings.EqualFold(strings.SplitN(entry, "=", 2)[0], name)
+		}
+		if matches {
+			environment[index] = prefix + value
+			return environment
+		}
+	}
+	return append(environment, prefix+value)
 }
 
 func (s *Server) loginHandler(w http.ResponseWriter, r *http.Request) {
@@ -860,12 +938,12 @@ func (s *Server) executeRequest(req ClientRequest) ServerResponse {
 			if shell == "" {
 				shell = "C:\\Windows\\System32\\cmd.exe"
 			}
-			args = []string{shell, "/C", req.Command}
+			args = []string{"/C", req.Command}
 		} else {
 			shell = "/bin/sh"
-			args = []string{shell, "-c", req.Command}
+			args = []string{"-c", req.Command}
 		}
-		output, err := runCommand(shell, args, path)
+		output, err := runCommand(shell, args, path, s.commandRuntime)
 		message := strings.TrimRight(string(output), "\r\n")
 		if err != nil {
 			if message == "" {
@@ -880,7 +958,13 @@ func (s *Server) executeRequest(req ClientRequest) ServerResponse {
 	}
 }
 
-func runCommand(program string, args []string, dir string) ([]byte, error) {
+func runCommand(program string, args []string, dir string, commandRuntime CommandRuntime) ([]byte, error) {
+	if commandRuntime.Timeout <= 0 {
+		commandRuntime.Timeout = 120 * time.Second
+	}
+	if len(commandRuntime.Environment) == 0 {
+		commandRuntime.Environment = os.Environ()
+	}
 	outputFile, err := os.CreateTemp("", "ui-command-output-*")
 	if err != nil {
 		return nil, err
@@ -888,16 +972,15 @@ func runCommand(program string, args []string, dir string) ([]byte, error) {
 	outputPath := outputFile.Name()
 	defer os.Remove(outputPath)
 
-	process, err := os.StartProcess(program, args, &os.ProcAttr{
-		Dir:   dir,
-		Files: []*os.File{os.Stdin, outputFile, outputFile},
-	})
-	if err != nil {
-		outputFile.Close()
-		return nil, err
-	}
-
-	state, waitErr := process.Wait()
+	ctx, cancel := context.WithTimeout(context.Background(), commandRuntime.Timeout)
+	defer cancel()
+	command := exec.CommandContext(ctx, program, args...)
+	command.Dir = dir
+	command.Env = commandRuntime.Environment
+	command.Stdin = os.Stdin
+	command.Stdout = outputFile
+	command.Stderr = outputFile
+	waitErr := command.Run()
 	if _, err := outputFile.Seek(0, 0); err != nil {
 		outputFile.Close()
 		return nil, err
@@ -907,11 +990,11 @@ func runCommand(program string, args []string, dir string) ([]byte, error) {
 	if readErr != nil {
 		return output, readErr
 	}
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return output, fmt.Errorf("command exceeded the %s timeout", commandRuntime.Timeout)
+	}
 	if waitErr != nil {
 		return output, waitErr
-	}
-	if !state.Success() {
-		return output, fmt.Errorf("command exited with %s", state.String())
 	}
 	return output, nil
 }

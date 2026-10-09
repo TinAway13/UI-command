@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -112,6 +113,57 @@ func TestLoadConfigArrays(t *testing.T) {
 	if len(config.AccessKeys) != 2 || config.AccessKeys[1] != "key_two" {
 		t.Fatalf("access keys = %#v, want two configured keys", config.AccessKeys)
 	}
+}
+
+func TestLoadCommandRuntime(t *testing.T) {
+	if _, err := loadCommandRuntime(defaultCommandRuntimeConfigPath); err != nil {
+		t.Fatalf("load default command config: %v", err)
+	}
+
+	configuredPath := "/configured-tools"
+	if runtime.GOOS == "windows" {
+		configuredPath = `C:\configured-tools`
+	}
+	fileConfig := CommandRuntimeFile{
+		Paths: map[string][]string{runtime.GOOS: {configuredPath}},
+		Environment: map[string]map[string]string{
+			runtime.GOOS: {"UI_COMMAND_TEST_VALUE": "loaded"},
+		},
+		TimeoutSeconds: 45,
+	}
+	content, err := json.Marshal(fileConfig)
+	if err != nil {
+		t.Fatalf("encode command config: %v", err)
+	}
+	configPath := filepath.Join(t.TempDir(), "command-config.json")
+	if err := os.WriteFile(configPath, content, 0600); err != nil {
+		t.Fatalf("write command config: %v", err)
+	}
+
+	config, err := loadCommandRuntime(configPath)
+	if err != nil {
+		t.Fatalf("load command config: %v", err)
+	}
+	if config.Timeout != 45*time.Second {
+		t.Fatalf("timeout = %s, want 45s", config.Timeout)
+	}
+	pathValue := environmentValue(config.Environment, "PATH")
+	if !strings.HasPrefix(strings.ToLower(pathValue), strings.ToLower(configuredPath)) {
+		t.Fatalf("PATH = %q, want prefix %q", pathValue, configuredPath)
+	}
+	if value := environmentValue(config.Environment, "UI_COMMAND_TEST_VALUE"); value != "loaded" {
+		t.Fatalf("UI_COMMAND_TEST_VALUE = %q, want loaded", value)
+	}
+}
+
+func environmentValue(environment []string, name string) string {
+	for _, entry := range environment {
+		parts := strings.SplitN(entry, "=", 2)
+		if len(parts) == 2 && strings.EqualFold(parts[0], name) {
+			return parts[1]
+		}
+	}
+	return ""
 }
 
 func TestCommandHandler(t *testing.T) {
